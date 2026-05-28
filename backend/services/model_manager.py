@@ -34,8 +34,79 @@ from core.config import IDLE_TIMEOUT_SECONDS, CPU_POOL_WORKERS
 
 logger = logging.getLogger("omnivoice.model")
 
-_gpu_pool = ThreadPoolExecutor(max_workers=1)
+# Per-TTS-job VRAM headroom estimate. OmniVoice's forward + autoregressive
+# decode peaks around 1.6 GB on a 24 kHz 8-second utterance; we budget 2.5 GB
+# to leave room for the ASR/diarization pipelines that run concurrently in
+# the same process. Tuned empirically — bumps to 3 GB if anyone reports OOM
+# at 16 GB on a multi-segment dub.
+_GPU_VRAM_PER_JOB_GB = 2.5
+_GPU_WORKER_CAP = 4
+
+_gpu_pool_singleton: "ThreadPoolExecutor | None" = None
 _cpu_pool = ThreadPoolExecutor(max_workers=CPU_POOL_WORKERS)
+
+
+def _pick_gpu_workers() -> int:
+    """Pick a sensible GPU worker count from the runtime environment.
+
+    Resolution order:
+      1. OMNIVOICE_GPU_WORKERS env var (explicit user override, clamped 1..16).
+      2. CUDA / ROCm: free VRAM // per-job budget, capped at 4.
+      3. MPS / CPU / unknown: 1.
+
+    Designed to fail safe — any exception → 1 worker, never propagated.
+    """
+    override = os.environ.get("OMNIVOICE_GPU_WORKERS")
+    if override:
+        try:
+            n = int(override)
+            return max(1, min(16, n))
+        except ValueError:
+            logger.warning("OMNIVOICE_GPU_WORKERS=%r is not an integer; ignoring", override)
+    try:
+        torch = _lazy_torch()
+        if hasattr(torch, "cuda") and torch.cuda.is_available():
+            free_bytes, _total = torch.cuda.mem_get_info()
+            free_gb = free_bytes / (1024 ** 3)
+            workers = max(1, min(_GPU_WORKER_CAP, int(free_gb // _GPU_VRAM_PER_JOB_GB)))
+            logger.info(
+                "GPU pool sized to %d worker(s) — %.1f GB free / %.1f GB per job (cap %d)",
+                workers, free_gb, _GPU_VRAM_PER_JOB_GB, _GPU_WORKER_CAP,
+            )
+            return workers
+        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            logger.info("GPU pool: MPS detected, using 1 worker (shared system memory)")
+            return 1
+    except Exception as e:
+        logger.warning("GPU worker probe failed (%s); defaulting to 1", e)
+    return 1
+
+
+def _build_gpu_pool() -> ThreadPoolExecutor:
+    workers = _pick_gpu_workers()
+    return ThreadPoolExecutor(max_workers=workers, thread_name_prefix="gpu-pool")
+
+
+def _get_gpu_pool() -> ThreadPoolExecutor:
+    """Internal accessor. Same singleton as the module-level `_gpu_pool`
+    attribute, but resolvable from inside this module (Python's module
+    `__getattr__` only fires for unresolved lookups from *outside*).
+    """
+    global _gpu_pool_singleton
+    if _gpu_pool_singleton is None:
+        _gpu_pool_singleton = _build_gpu_pool()
+    return _gpu_pool_singleton
+
+
+def __getattr__(name: str):
+    """Lazy module attribute — initialises `_gpu_pool` on first access so we
+    can probe the device after torch finishes its lazy import. Without this
+    we'd be forced to commit to max_workers=1 at module import time, before
+    knowing whether CUDA is even available.
+    """
+    if name == "_gpu_pool":
+        return _get_gpu_pool()
+    raise AttributeError(f"module 'services.model_manager' has no attribute {name!r}")
 
 model = None  # type: ignore
 _model_lock = asyncio.Lock()
@@ -252,7 +323,7 @@ async def get_model():
     async with _model_lock:
         if model is None:
             loop = asyncio.get_running_loop()
-            model = await loop.run_in_executor(_gpu_pool, _load_model_sync)
+            model = await loop.run_in_executor(_get_gpu_pool(), _load_model_sync)
     return model
 
 
@@ -283,7 +354,7 @@ async def preload_model():
         async with _model_lock:
             if model is None:
                 loop = asyncio.get_running_loop()
-                model = await loop.run_in_executor(_gpu_pool, _load_model_sync)
+                model = await loop.run_in_executor(_get_gpu_pool(), _load_model_sync)
         logger.info("Preload complete — model ready.")
     except Exception as e:
         logger.warning("Model preload failed (non-fatal): %s", e)
@@ -401,13 +472,68 @@ def restore_tts_after_asr():
 
 _diar_pipeline = None
 
-def get_diarization_pipeline():
+# Sentinel error classes used by callers (dub_core) to decide whether to
+# emit a structured SSE warning with a docs deeplink. Kept as module-level
+# constants so tests can pin them — they cross the SSE wire and the
+# frontend's errorDocsMap classifies on the same strings.
+DIARIZATION_ERR_NO_TOKEN = "NO_TOKEN"
+DIARIZATION_ERR_LICENSE  = "PYANNOTE_LICENSE_REQUIRED"
+DIARIZATION_ERR_LOAD     = "LOAD_FAILED"
+
+
+def _classify_diarization_error(exc: BaseException) -> str:
+    """Map a pyannote/HF-hub exception to one of the diarization error
+    sentinels above.
+
+    The 401/403 path is the canonical "user hasn't accepted the model
+    license on huggingface.co" symptom — both `Pipeline.from_pretrained`
+    and `huggingface_hub` raise distinct exception classes for it
+    depending on the installed versions, so we sniff on both the class
+    name and the stringified message rather than importing the
+    `HfHubHTTPError` symbol directly (which is not stable across
+    huggingface_hub majors).
+    """
+    name = type(exc).__name__.lower()
+    msg = str(exc).lower()
+    if (
+        "401" in msg
+        or "403" in msg
+        or "unauthorized" in msg
+        or "gated" in msg
+        or "accept" in msg and ("license" in msg or "terms" in msg or "user conditions" in msg)
+        or "hfhubhttperror" in name
+        or "gatedrepoerror" in name
+        or "repositorynotfounderror" in name and "gated" in msg
+    ):
+        return DIARIZATION_ERR_LICENSE
+    return DIARIZATION_ERR_LOAD
+
+
+def get_diarization_pipeline(return_error: bool = False):
+    """Load (or return the cached) pyannote speaker-diarization-3.1 pipeline.
+
+    Default return: the pipeline instance, or `None` if anything went
+    wrong (no token, license not accepted, model load crashed). Existing
+    callers (dub_core legacy `_transcribe`) rely on the `None` sentinel.
+
+    When `return_error=True`, returns a 2-tuple
+    `(pipeline | None, error_sentinel | None)` where `error_sentinel` is
+    one of the `DIARIZATION_ERR_*` constants. This shape is what the
+    streaming `_diarize` path uses to emit a structured SSE warning with
+    a docs deeplink — issue #78.
+    """
     global _diar_pipeline
-    hf_token = os.environ.get("HF_TOKEN")
-    if not hf_token:
-        return None
     if _diar_pipeline is not None:
-        return _diar_pipeline
+        return (_diar_pipeline, None) if return_error else _diar_pipeline
+
+    # Phase 1 AUTH-01: 3-source resolver (App → Env → HF-CLI). Per
+    # Pitfall #1 in 01-RESEARCH.md — exactly one place in the backend
+    # reads HF tokens, and that place is `token_resolver.resolve()`.
+    from services import token_resolver
+    resolved = token_resolver.resolve()
+    if not resolved:
+        return (None, DIARIZATION_ERR_NO_TOKEN) if return_error else None
+    hf_token = resolved.token
     try:
         torch = _lazy_torch()
         from pyannote.audio import Pipeline
@@ -418,7 +544,10 @@ def get_diarization_pipeline():
         if device in ("cuda",):
             _diar_pipeline.to(torch.device(device))
         logger.info("Pyannote Diarization Pipeline loaded on %s.", device)
-        return _diar_pipeline
+        return (_diar_pipeline, None) if return_error else _diar_pipeline
     except Exception as e:
-        logger.error(f"Failed to load Pyannote pipeline: {e}")
-        return None
+        err_class = _classify_diarization_error(e)
+        logger.error(
+            "Failed to load Pyannote pipeline (class=%s): %s", err_class, e,
+        )
+        return (None, err_class) if return_error else None

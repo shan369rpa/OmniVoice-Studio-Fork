@@ -38,6 +38,14 @@
 > [!WARNING]
 > **OmniVoice Studio is in active beta.** Things may break between releases. For the latest features and fixes, clone the repo and run from source rather than using pre-built installers. Bug reports and PRs are very welcome — [open an issue](https://github.com/debpalash/OmniVoice-Studio/issues) or [join Discord](https://discord.gg/bzQavDfVV9).
 
+<div align="center">
+  <br/>
+  <a href="https://discord.gg/bzQavDfVV9"><img src="https://img.shields.io/badge/💬_Join_the_Community-Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Join Discord" /></a>
+  <br/>
+  <sub>Get setup help · Share your dubs · Vote on the roadmap · Early access to new engines</sub>
+  <br/>
+</div>
+
 <br/>
 
 ## Features
@@ -105,176 +113,21 @@
 
 ## Quickstart
 
-Pick your path — from zero-install to full developer setup:
+Per-OS install guides — pick yours and follow it end-to-end:
 
-<table>
-<tr>
-<td width="33%" align="center">
-<h3>🖥️ Desktop App</h3>
-<sub><b>Easiest</b> · ~2 min · No dependencies</sub>
-<br/><br/>
-<a href="https://github.com/debpalash/OmniVoice-Studio/releases/latest"><img src="https://img.shields.io/badge/Download-Installer-10b981?style=for-the-badge&logo=github&logoColor=white" alt="Download"/></a>
-<br/><br/>
-<sub>macOS DMG · Windows MSI · Linux AppImage/deb<br/>Auto-bootstraps Python + models on first launch.</sub>
-</td>
-<td width="33%" align="center">
-<h3>🐳 Docker</h3>
-<sub><b>One command</b> · ~3 min · Needs Docker</sub>
-<br/><br/>
-<code>docker pull ghcr.io/debpalash/omnivoice-studio</code>
-<br/><br/>
-<sub>Pre-built image from GHCR.<br/>CPU + NVIDIA GPU supported.</sub>
-</td>
-<td width="33%" align="center">
-<h3>⚡ From Source</h3>
-<sub><b>Full control</b> · ~5 min · Needs Bun + Python</sub>
-<br/><br/>
-<code>git clone → bun install → bun run dev</code>
-<br/><br/>
-<sub>Hot reload, full codebase access.<br/>Best for contributors.</sub>
-</td>
-</tr>
-</table>
+- **macOS** — [docs/install/macos.md](docs/install/macos.md)
+- **Windows** — [docs/install/windows.md](docs/install/windows.md)
+- **Linux** — [docs/install/linux.md](docs/install/linux.md)
+- **Docker** — [docs/install/docker.md](docs/install/docker.md)
 
----
+Stuck? See [docs/install/troubleshooting.md](docs/install/troubleshooting.md)
+for the top 10 install errors. The in-app error UI deeplinks to those entries
+when something breaks at runtime.
 
-### 🖥️ Option 1 — Desktop App
-
-Pre-built installers (~6–8 MB) are on the [**Releases**](https://github.com/debpalash/OmniVoice-Studio/releases/latest) page. Download, install, launch. The app bootstraps a Python environment and downloads model weights automatically — the splash screen shows progress.
-
-<details>
-<summary><b>macOS — "app is damaged and can't be opened"</b></summary>
-<br/>
-
-macOS quarantines apps downloaded outside the App Store. After dragging to `/Applications`:
-
-```bash
-xattr -cr /Applications/OmniVoice\ Studio.app
-```
-
-Open normally after. One-time fix.
-</details>
-
-<details>
-<summary><b>Windows — first launch takes 5–10 minutes</b></summary>
-<br/>
-
-The app bootstraps a Python virtual environment, installs dependencies, and downloads ffmpeg on first run. The splash screen shows each step. Subsequent launches start in seconds.
-</details>
-
-<details>
-<summary><b>Linux — AppImage needs FUSE</b></summary>
-<br/>
-
-If FUSE isn't available, use the `.deb` package or extract-and-run:
-
-```bash
-chmod +x OmniVoice.Studio_*.AppImage
-./OmniVoice.Studio_*.AppImage --appimage-extract-and-run
-```
-</details>
-
-<details>
-<summary><b>Linux — White screen on Fedora 44 / Ubuntu 24.04</b></summary>
-<br/>
-
-Some newer distros ship a WebKit/GTK version with compositing issues. Try:
-
-```bash
-WEBKIT_DISABLE_COMPOSITING_MODE=1 ./OmniVoice.Studio_*.AppImage
-```
-
-If that doesn't help, use the `.deb` package or run from source instead.
-</details>
-
-<details>
-<summary><b>Installation fails behind a firewall / in Russia</b></summary>
-<br/>
-
-The desktop app downloads Python from GitHub during first launch. If your network blocks GitHub:
-
-1. Install Python 3.11 manually from [python.org](https://python.org/downloads/)
-2. Set `UV_PYTHON_PREFERENCE=system` before launching, or run from source with `bun run dev`
-3. For PyPI mirrors: set `UV_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/`
-</details>
-
----
-
-### 🐳 Option 2 — Docker
-
-Pull the pre-built image from **GitHub Container Registry**:
-
-```bash
-docker pull ghcr.io/debpalash/omnivoice-studio:latest
-```
-
-**Run it:**
-
-```bash
-# CPU mode
-docker run -d --name omnivoice \
-  -p 127.0.0.1:3900:3900 \
-  -v omnivoice-data:/app/omnivoice_data \
-  ghcr.io/debpalash/omnivoice-studio:latest
-
-# NVIDIA GPU mode
-docker run -d --name omnivoice --gpus all \
-  -p 127.0.0.1:3900:3900 \
-  -v omnivoice-data:/app/omnivoice_data \
-  ghcr.io/debpalash/omnivoice-studio:latest
-```
-
-**Or use Docker Compose:**
-
-```bash
-# CPU
-docker compose -f deploy/docker-compose.yml up -d
-
-# GPU
-docker compose -f deploy/docker-compose.yml --profile gpu up -d
-```
-
-Open [localhost:3900](http://localhost:3900) once the health check passes. First run downloads ~4 GB of model weights — progress in `docker compose logs -f`.
-
-<details>
-<summary><b>Build from source instead of pulling</b></summary>
-<br/>
-
-```bash
-docker compose -f deploy/docker-compose.yml up --build -d
-```
-
-</details>
-
-> **Network access:** the container binds to `127.0.0.1` only. To expose on your LAN, change the port mapping to `"0.0.0.0:3900:3900"`. OmniVoice ships no authentication — put it behind a reverse proxy with auth (Caddy `basic_auth`, nginx + htpasswd, Tailscale, etc.).
-
----
-
-### ⚡ Option 3 — From Source
-
-```bash
-git clone https://github.com/debpalash/OmniVoice-Studio.git && cd OmniVoice-Studio
-bun install && bun run dev
-```
-
-Open [localhost:3901](http://localhost:3901) and start cloning voices. Hot-reload enabled for both frontend and backend.
-
-```bash
-bun run desktop    # Build the native desktop app from source
-```
-
-| Service | URL | Stack |
-|---------|-----|-------|
-| **Backend** | `localhost:3900` | FastAPI · 97 endpoints · WhisperX · Demucs · OmniVoice |
-| **Frontend** | `localhost:3901` | React · Vite · Waveform timeline · Glassmorphism UI |
-| **API Docs** | [`localhost:3900/docs`](http://localhost:3900/docs) | Scalar — interactive API reference |
-
-> [!NOTE]
-> First run downloads model weights (~2.4 GB). No account needed. For faster downloads, optionally set `HF_TOKEN=hf_...` in your environment ([get a free token here](https://huggingface.co/settings/tokens)).
->
-> **Having issues?** Join our [Discord](https://discord.gg/bzQavDfVV9) for setup help and troubleshooting.
-
----
+For Hugging Face token setup, see
+[docs/setup/huggingface-token.md](docs/setup/huggingface-token.md). For
+diarization-specific gating, see
+[docs/features/diarization.md](docs/features/diarization.md).
 
 ## Screenshots
 
@@ -344,6 +197,13 @@ ElevenLabs charges **$5–$330/mo** and processes your audio on their servers. O
 | **Customizable** | ❌ Closed | ✅ Fork it, extend it, ship it |
 
 OmniVoice Studio gives you professional-grade AI tools without the subscription or the cloud.
+
+<div align="center">
+  <br/>
+  <b>Convinced? Come build with us.</b><br/>
+  <a href="https://discord.gg/bzQavDfVV9"><img src="https://img.shields.io/badge/Join_Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Join Discord" /></a>
+  <br/><br/>
+</div>
 
 ---
 
@@ -424,6 +284,26 @@ OmniVoice ships a multi-engine TTS backend. The default engine (OmniVoice) is al
 - 📖 **Audiobook Editor** — chapter-aware long-form narration
 - 🌐 **Hosted Demo** — try OmniVoice without installing anything
 - 🔌 **Plugin Marketplace** — community-contributed TTS engines and effects
+
+---
+
+## Community
+
+<div align="center">
+  <a href="https://discord.gg/bzQavDfVV9"><img src="https://img.shields.io/badge/💬_Discord-Join_Community-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Join Discord" /></a>
+</div>
+
+<br/>
+
+| Channel | What happens there |
+|---------|--------------------|
+| `#showcase` | Members share their dubs, clones, and voice designs |
+| `#help` | Setup issues, GPU troubleshooting, model questions |
+| `#feature-requests` | Vote on what gets built next |
+| `#dev` | Architecture discussions, PR reviews, engine integrations |
+| `#announcements` | Release notes, breaking changes, early access |
+
+**[→ Join the Discord](https://discord.gg/bzQavDfVV9)** — we respond to setup questions within hours, not days.
 
 ---
 
@@ -510,7 +390,8 @@ OmniVoice Studio is built on the shoulders of exceptional open-source work:
 <br/>
 
 If you read this far, you're our kind of person.<br/>
-**[⭐ Star this repo](https://github.com/debpalash/OmniVoice-Studio)** so others can find it too.
+**[⭐ Star this repo](https://github.com/debpalash/OmniVoice-Studio)** so others can find it too.<br/>
+**[💬 Join the Discord](https://discord.gg/bzQavDfVV9)** to share what you build.
 
 <br/>
 

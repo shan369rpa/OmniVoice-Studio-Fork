@@ -28,13 +28,23 @@ case "$OS" in
 esac
 
 # ── Platform-specific paths ───────────────────────────────────────────────
+# Two directories matter for fresh-install simulation:
+#   APP_DATA     — Tauri's bundle dir (keyed by APP_ID); holds the post-install
+#                  Python venv + webview state.
+#   BACKEND_DATA — Where backend/core/config.py::get_app_data_dir() writes:
+#                  SQLite db, voice profiles, generation outputs, logs. This is
+#                  NOT under APP_ID — it's a separate hardcoded name. Cleaning
+#                  only APP_DATA leaves all user data behind, defeating the
+#                  fresh-emulation promise.
 if [ "$PLATFORM" = "macos" ]; then
   APP_DATA="$HOME/Library/Application Support/${APP_ID}"
+  BACKEND_DATA="$HOME/Library/Application Support/OmniVoice"
   TAURI_LOGS="$HOME/Library/Logs/${APP_ID}"
   WEBKIT_DATA="$HOME/Library/WebKit/${APP_ID}"
 else
-  # Linux: XDG conventions
+  # Linux: backend uses ~/.omnivoice (not XDG — see backend/core/config.py).
   APP_DATA="${XDG_DATA_HOME:-$HOME/.local/share}/${APP_ID}"
+  BACKEND_DATA="$HOME/.omnivoice"
   TAURI_LOGS="${XDG_DATA_HOME:-$HOME/.local/share}/${APP_ID}/logs"
   WEBKIT_DATA="${XDG_DATA_HOME:-$HOME/.local/share}/${APP_ID}/webview"
 fi
@@ -45,16 +55,19 @@ HF_CACHE="${HF_HOME:-$HOME/.cache/huggingface}"
 # ── Flags ──────────────────────────────────────────────────────────────────
 SKIP_BUILD=false
 KEEP_DATA=false
+PILL_MODE=false
 
 for arg in "$@"; do
   case "$arg" in
     --skip-build) SKIP_BUILD=true ;;
     --keep-data)  KEEP_DATA=true ;;
+    --pill)       PILL_MODE=true ;;
     -h|--help)
-      echo "Usage: $0 [--skip-build] [--keep-data]"
+      echo "Usage: $0 [--skip-build] [--keep-data] [--pill]"
       echo ""
       echo "  --skip-build  Skip cargo build, use last compiled binary"
       echo "  --keep-data   Don't wipe app data (test upgrade path)"
+      echo "  --pill        Launch in dictation-widget mode (no main window)"
       exit 0
       ;;
   esac
@@ -65,12 +78,22 @@ if [ "$KEEP_DATA" = false ]; then
   echo "🧹 Cleaning all OmniVoice data for fresh prod emulation..."
   echo ""
 
-  # 1. App data (venv, config, bundled backend)
+  # 1. App data (Tauri bundle dir: post-install venv + webview state)
   if [ -d "${APP_DATA}" ]; then
     echo "   ✗ App data:     ${APP_DATA}"
     rm -rf "${APP_DATA}"
   else
     echo "   ○ App data:     (already clean)"
+  fi
+
+  # 1b. Backend data (SQLite db, voice profiles, outputs, logs)
+  #     — separate dir hardcoded in backend/core/config.py, NOT under APP_ID.
+  if [ -d "${BACKEND_DATA}" ]; then
+    BD_SIZE=$(du -sh "${BACKEND_DATA}" 2>/dev/null | cut -f1)
+    echo "   ✗ Backend data: ${BACKEND_DATA} (${BD_SIZE})"
+    rm -rf "${BACKEND_DATA}"
+  else
+    echo "   ○ Backend data: (already clean)"
   fi
 
   # 2. HF model cache (downloaded .safetensors, tokenizers, etc.)
@@ -151,6 +174,13 @@ else
   echo "⏭️  Skipping build (--skip-build)"
 fi
 
+# ── Build launch args ──────────────────────────────────────────────────────
+LAUNCH_ARGS=()
+if [ "$PILL_MODE" = true ]; then
+  LAUNCH_ARGS+=("--pill")
+  echo "📌 Launch mode: pill (dictation-only widget, no main window)"
+fi
+
 # ── Find and launch the app ────────────────────────────────────────────────
 if [ "$PLATFORM" = "macos" ]; then
   APP_BUNDLE="${TAURI_DIR}/target/debug/bundle/macos/${APP_NAME}.app"
@@ -160,12 +190,17 @@ if [ "$PLATFORM" = "macos" ]; then
     echo ""
     echo "🚀 Launching ${APP_NAME} (.app bundle)..."
     echo "   Bundle: ${APP_BUNDLE}"
-    open "$APP_BUNDLE"
+    # macOS `open` needs -n to spawn a fresh instance, --args to forward flags.
+    if [ ${#LAUNCH_ARGS[@]} -gt 0 ]; then
+      open -n "$APP_BUNDLE" --args "${LAUNCH_ARGS[@]}"
+    else
+      open "$APP_BUNDLE"
+    fi
   elif [ -f "$BINARY" ]; then
     echo ""
     echo "🚀 Launching ${APP_NAME} (raw binary — no .app bundle)..."
     echo "   Binary: ${BINARY}"
-    "$BINARY" &
+    "$BINARY" "${LAUNCH_ARGS[@]}" &
   else
     echo "❌ No bundle or binary found. Run without --skip-build first."
     exit 1
@@ -180,12 +215,12 @@ else
     echo "🚀 Launching ${APP_NAME} (AppImage)..."
     echo "   AppImage: ${APPIMAGE}"
     chmod +x "$APPIMAGE"
-    "$APPIMAGE" &
+    "$APPIMAGE" "${LAUNCH_ARGS[@]}" &
   elif [ -f "$BINARY" ]; then
     echo ""
     echo "🚀 Launching ${APP_NAME} (raw binary)..."
     echo "   Binary: ${BINARY}"
-    "$BINARY" &
+    "$BINARY" "${LAUNCH_ARGS[@]}" &
   else
     echo "❌ No AppImage or binary found. Run without --skip-build first."
     exit 1
@@ -195,4 +230,10 @@ fi
 echo "   App data: ${APP_DATA}"
 echo ""
 echo "✅ App launched. Check the splash screen for bootstrap logs."
-echo "   To re-run without rebuilding: bun desktop-prod:run"
+if [ "$PILL_MODE" = true ]; then
+  echo "   To re-run pill mode without rebuilding: bun desktop-prod:run:pill"
+  echo "   To switch back to studio: bun desktop-prod:run"
+else
+  echo "   To re-run without rebuilding: bun desktop-prod:run"
+  echo "   To launch as dictation widget: bun desktop-prod:pill"
+fi

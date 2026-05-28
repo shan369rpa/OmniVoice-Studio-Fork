@@ -10,6 +10,7 @@ on:
     branches: [main]
   push:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -56,10 +57,22 @@ jobs:
           version: 1.0
 
       - name: Install Python deps
-        run: uv sync
+        # `--all-extras` installs optional engine deps (e.g. `supertonic`)
+        # so their tests can exercise the real import path, not the
+        # "package not installed" fallback. Smoke job below stays on bare
+        # `uv sync` because smoke only hits /health + fixture profiles.
+        run: uv sync --all-extras
 
       - name: Run pytest
         run: uv run pytest tests/ -q --tb=short
+
+      # Docs-drift CI gate (Phase 1 INST-06). The validator extracts code
+      # blocks tagged `<!-- validate -->` from docs/install/*.md and asserts
+      # each line appears in scripts/desktop-prod.sh after normalisation.
+      # Its own correctness is enforced by tests/scripts/test_validate_install_docs.py
+      # (checker B-5) — those tests run in the previous step.
+      - name: Validate install docs against desktop-prod.sh
+        run: python scripts/validate-install-docs.py
 
       # `backend/tests/` stubs core.config in sys.modules to avoid the heavy
       # main app import chain — that pollutes import state for other modules,
@@ -83,9 +96,11 @@ jobs:
 
       # checkJs is true in tsconfig for IDE feedback, but 947 pre-existing
       # JS errors remain. Override to false in CI so only .ts files block.
+      # Sourced from `typecheck:ci` in frontend/package.json so the release
+      # workflow runs an identical command — drift broke v0.3.x release runs.
       - name: Frontend typecheck
         working-directory: frontend
-        run: bunx tsc --noEmit --checkJs false
+        run: bun run typecheck:ci
 
       - name: Run Vitest (frontend)
         working-directory: frontend
@@ -172,3 +187,146 @@ jobs:
       - name: Cargo check (Tauri shell)
         working-directory: frontend/src-tauri
         run: cargo check --target ${{ matrix.rust_target }} --message-format=short
+
+  # ── Cross-platform Python runtime smoke (Phase 0 GATE-02) ───────────────
+  # Loads the frozen tests/fixtures/omnivoice_data/ fixture and boots the
+  # FastAPI app in-process via TestClient on macOS/Windows/Linux. Catches
+  # platform-specific Python import / path bugs that the Linux-only `test`
+  # job above misses. Narrow scope (tests/smoke/ only) — full pytest stays
+  # on Linux until Phase 1's INST-01 lands setuptools for WhisperX.
+  smoke-matrix:
+    name: Smoke (${{ matrix.label }})
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            label: macOS
+          - os: windows-2022
+            label: Windows
+          - os: ubuntu-22.04
+            label: Linux
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    env:
+      # Restricted-network resilience (RESEARCH Pitfall #6) — keeps uv from
+      # giving up on the first slow PyPI / python-build-standalone fetch.
+      UV_HTTP_TIMEOUT: "120"
+      UV_HTTP_RETRIES: "5"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      # ffmpeg + libsndfile are needed by soundfile / audio fixtures even
+      # though the silence WAV doesn't decode anything heavy — keeps test
+      # collection from import-erroring on optional audio modules.
+      - name: System deps (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg libsndfile || true
+
+      - name: System deps (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          choco install ffmpeg -y --no-progress
+          ffmpeg -version
+
+      - name: System deps (Linux)
+        if: runner.os == 'Linux'
+        uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          packages: ffmpeg libsndfile1
+          version: 1.0
+
+      - name: Install Python deps
+        run: uv sync
+
+      - name: Run smoke tests
+        run: uv run pytest tests/smoke/ -q --tb=short
+
+  # Phase 4 Plan 04-01 (GGUF-03 / GATE-03): build the `omnivoice-tts`
+  # C++ runtime binary from the pinned `omnivoice.cpp` commit SHA for
+  # each platform we ship to.
+  #
+  # Pinned SHA lives in backend/engines/omnivoice_gguf/quant_map.json
+  # `_meta.runtime_commit_sha`. The job extracts it via `jq` so PRs
+  # touching the pin re-trigger a full rebuild automatically.
+  #
+  # The `macos-14` (Apple Silicon) slot is `continue-on-error: true`
+  # because the upstream `omnivoice.cpp` README does not publish a
+  # `buildmetal.sh` (Pitfall 1 in 04-RESEARCH.md). A failed Metal build
+  # is documented as a known gap; the SPIKE-01 ADR records the fallback
+  # to in-process OmniVoiceBackend on Apple Silicon when this slot fails.
+  build-omnivoice-tts:
+    name: Build omnivoice-tts (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x86_64
+            experimental: false
+          - os: windows-latest
+            platform: windows-x86_64
+            experimental: false
+          - os: macos-13
+            platform: darwin-x86_64
+            # Intel-Mac runners (macos-13) are heavily contended in GitHub's
+            # hosted pool — builds frequently queue >30 min and block merges
+            # even though Apple's own platform momentum is on arm64. The
+            # engine's runtime gracefully reports unavailable on a missing
+            # binary, so a failed/missing darwin-x86_64 build degrades
+            # cleanly rather than crashing. Marking experimental so PRs
+            # aren't held hostage by Intel-Mac runner backlog.
+            experimental: true
+          - os: macos-14
+            platform: darwin-arm64
+            # Metal build path is unpublished upstream — see Pitfall 1.
+            experimental: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read pinned omnivoice.cpp SHA from quant_map.json
+        id: pin
+        shell: bash
+        run: |
+          sha=$(python -c "import json,sys; print(json.load(open('backend/engines/omnivoice_gguf/quant_map.json'))['_meta']['runtime_commit_sha'])")
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      # Linux-only: upstream `buildcpu.sh` enables `-DGGML_BLAS=ON` which
+      # requires a system BLAS implementation at cmake configure time.
+      # ubuntu-latest does not preinstall any (`Could NOT find BLAS
+      # (missing: BLAS_LIBRARIES)`), so we install OpenBLAS + pkg-config
+      # here. macOS uses Accelerate (built in) and Windows builds without
+      # the BLAS backend, so neither needs this step.
+      - name: Linux system deps (BLAS for ggml-blas backend)
+        if: matrix.platform == 'linux-x86_64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libopenblas-dev pkg-config
+
+      - name: Build omnivoice-tts
+        shell: bash
+        run: |
+          bash scripts/build-omnivoice-tts.sh \
+            --platform ${{ matrix.platform }} \
+            --commit-sha ${{ steps.pin.outputs.sha }}
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: omnivoice-tts-${{ matrix.platform }}
+          path: |
+            bin/omnivoice-tts-${{ matrix.platform }}*
+            bin/checksums.sha256

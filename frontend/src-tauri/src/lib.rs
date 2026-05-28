@@ -59,10 +59,18 @@ pub const TRAY_ICON_RECORDING: &[u8] = include_bytes!("../icons/tray-recording.p
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // ── Detect pill mode from CLI args ────────────────────────────────────
-    let pill_mode = std::env::args().any(|a| a == "--pill");
+    // ── Detect pill mode from CLI args OR persisted config ────────────────
+    // CLI flag takes precedence. If not passed, fall back to the
+    // `launch_as_widget` config field (set via tray "Switch to Pill Mode" or
+    // Settings → Launch options checkbox). This means a user can configure
+    // "launch as widget by default" once and never need to remember the flag.
+    let cli_pill = std::env::args().any(|a| a == "--pill");
+    let pill_mode = cli_pill || crate::config::load_config_pre_app().launch_as_widget;
     if pill_mode {
-        log::info!("Starting in pill (dictation-only) mode");
+        log::info!(
+            "Starting in pill (dictation-only) mode (source: {})",
+            if cli_pill { "--pill flag" } else { "config.launch_as_widget" }
+        );
         // On macOS, hide the Dock icon in pill mode so only the tray shows.
         // This is handled after the app builds via set_activation_policy.
     }
@@ -96,6 +104,8 @@ pub fn run() {
             commands::quit_app,
             commands::get_dictation_shortcut,
             commands::set_dictation_shortcut,
+            commands::get_launch_as_widget,
+            commands::set_launch_as_widget,
             commands::enable_pill_autostart,
             commands::disable_pill_autostart,
             commands::is_pill_autostart_enabled,
@@ -105,8 +115,17 @@ pub fn run() {
             app.handle().plugin(tauri_plugin_updater::Builder::new().build())?;
             app.handle().plugin(tauri_plugin_process::init())?;
             app.handle().plugin(tauri_plugin_opener::init())?;
-            app.handle()
-                .plugin(tauri_plugin_window_state::Builder::default().build())?;
+            // Exclude the dictation widget from state persistence — otherwise
+            // `tauri-plugin-window-state` restores `visible: true` on next
+            // launch if the user happened to be dictating when they quit,
+            // overriding the WebviewWindowBuilder `.visible(false)` below.
+            // Symptom: pill appears on app load with no shortcut press.
+            // The main window is fine to persist (size/position are useful).
+            app.handle().plugin(
+                tauri_plugin_window_state::Builder::default()
+                    .with_denylist(&["widget"])
+                    .build(),
+            )?;
             app.handle().plugin(
                 tauri_plugin_log::Builder::new()
                     .level(log::LevelFilter::Info)
@@ -118,6 +137,35 @@ pub fn run() {
                     ])
                     .build(),
             )?;
+
+            // ── Programmatic widget window creation ──────────────────────
+            // Tauri 2's config-array creation silently dropped the widget
+            // window (declared in tauri.conf.json with create:false to
+            // make the handoff explicit). Some combination of transparent
+            // + decorations:false + visible:false + always-on-top was being
+            // rejected without an error. Building via WebviewWindowBuilder
+            // works and surfaces real errors on failure.
+            {
+                use tauri::{WebviewWindowBuilder, WebviewUrl};
+                let result = WebviewWindowBuilder::new(
+                    app,
+                    "widget",
+                    WebviewUrl::App("index.html".into()),
+                )
+                .title("Capture")
+                .inner_size(300.0, 64.0)
+                .resizable(false)
+                .transparent(true)
+                .decorations(false)
+                .always_on_top(true)
+                .visible(false)
+                .skip_taskbar(true)
+                .center()
+                .build();
+                if let Err(e) = result {
+                    log::error!("Failed to create widget window: {e:?}");
+                }
+            }
 
             app.manage(AppFlags {
                 quitting: AtomicBool::new(false),
@@ -144,13 +192,18 @@ pub fn run() {
                                     log::info!("Global shortcut pressed: dictation start");
                                     // Show the widget window (works in both pill + studio mode)
                                     if let Some(win) = app_handle.get_webview_window("widget") {
-                                        // Position pill near top-center of primary monitor
+                                        // Position pill at bottom-center — WhisperFlow / Ghost-Pepper
+                                        // style. 80px margin from bottom clears macOS dock + Windows
+                                        // taskbar + most Linux panels. Same math on all platforms.
                                         if let Ok(Some(monitor)) = win.primary_monitor() {
                                             let size = monitor.size();
                                             let scale = monitor.scale_factor();
-                                            let x = ((size.width as f64 / scale) / 2.0 - 150.0) as i32;
+                                            let logical_w = size.width as f64 / scale;
+                                            let logical_h = size.height as f64 / scale;
+                                            let x = (logical_w / 2.0 - 150.0) as i32;
+                                            let y = (logical_h - 64.0 - 80.0) as i32;
                                             let _ = win.set_position(tauri::Position::Logical(
-                                                tauri::LogicalPosition::new(x as f64, 60.0),
+                                                tauri::LogicalPosition::new(x as f64, y as f64),
                                             ));
                                         } else {
                                             let _ = win.center();
@@ -223,6 +276,9 @@ pub fn run() {
                 let dictate_i = MenuItemBuilder::new("Start Dictation  ⌘⇧Space")
                     .id("dictate")
                     .build(app)?;
+                let switch_to_pill_i = MenuItemBuilder::new("Switch to Dictation Widget")
+                    .id("switch_to_pill")
+                    .build(app)?;
                 let settings_i = MenuItemBuilder::new("Settings")
                     .id("settings")
                     .build(app)?;
@@ -233,6 +289,7 @@ pub fn run() {
                     .item(&show_i)
                     .separator()
                     .item(&dictate_i)
+                    .item(&switch_to_pill_i)
                     .item(&settings_i)
                     .separator()
                     .item(&quit_i)
@@ -255,22 +312,69 @@ pub fn run() {
                             }
                         }
                         "open_studio" => {
-                            // Launch ourselves without --pill to open the full studio
+                            // Persist the preference (so next launch is studio, not pill)
+                            // then spawn a new instance without --pill and exit this one.
+                            let mut cfg = crate::config::load_config(app);
+                            cfg.launch_as_widget = false;
+                            crate::config::save_config(app, &cfg);
+                            if let Ok(exe) = std::env::current_exe() {
+                                let _ = std::process::Command::new(exe).spawn();
+                            }
+                            app.state::<AppFlags>()
+                                .quitting
+                                .store(true, Ordering::SeqCst);
+                            app.exit(0);
+                        }
+                        "switch_to_pill" => {
+                            // Mirror of "open_studio" but the other direction:
+                            // persist launch_as_widget=true, relaunch with --pill,
+                            // and exit the current (studio) instance.
+                            let mut cfg = crate::config::load_config(app);
+                            cfg.launch_as_widget = true;
+                            crate::config::save_config(app, &cfg);
                             if let Ok(exe) = std::env::current_exe() {
                                 let _ = std::process::Command::new(exe)
+                                    .arg("--pill")
                                     .spawn();
                             }
+                            app.state::<AppFlags>()
+                                .quitting
+                                .store(true, Ordering::SeqCst);
+                            app.exit(0);
                         }
                         "dictate" => {
                             // Toggle: if the widget is visible (recording), stop;
-                            // otherwise start dictation.
+                            // otherwise start dictation. On start, show + position
+                            // + focus the widget BEFORE emitting tray-dictate so
+                            // the user sees the pill instead of silent recording.
+                            // Positioning mirrors the global-shortcut handler:
+                            // bottom-center (WhisperFlow style).
                             if let Some(win) = app.get_webview_window("widget") {
                                 if win.is_visible().unwrap_or(false) {
                                     let _ = app.emit("tray-dictate-stop", ());
                                 } else {
+                                    if let Ok(Some(monitor)) = win.primary_monitor() {
+                                        let size = monitor.size();
+                                        let scale = monitor.scale_factor();
+                                        let logical_w = size.width as f64 / scale;
+                                        let logical_h = size.height as f64 / scale;
+                                        let x = (logical_w / 2.0 - 150.0) as i32;
+                                        let y = (logical_h - 64.0 - 80.0) as i32;
+                                        let _ = win.set_position(tauri::Position::Logical(
+                                            tauri::LogicalPosition::new(x as f64, y as f64),
+                                        ));
+                                    } else {
+                                        let _ = win.center();
+                                    }
+                                    let _ = win.show();
+                                    let _ = win.set_focus();
                                     let _ = app.emit("tray-dictate", ());
                                 }
                             } else {
+                                log::warn!(
+                                    "Tray dictate: widget window not found — \
+                                     emitting tray-dictate without visible UI"
+                                );
                                 let _ = app.emit("tray-dictate", ());
                             }
                         }
@@ -299,7 +403,7 @@ pub fn run() {
 
             // ── Hide the unused window per mode ──────────────────────────
             if pill_mode_setup {
-                // Pill mode: hide the main window, keep widget ready
+                // Pill mode: hide the main window
                 if let Some(main_win) = app.get_webview_window("main") {
                     let _ = main_win.hide();
                     let _ = main_win.set_skip_taskbar(true);
@@ -309,9 +413,45 @@ pub fn run() {
                 {
                     let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
                 }
+                // Pill mode: widget stays HIDDEN until activated by global
+                // shortcut or tray 'Start Dictation'. Pre-position it now so
+                // the first show appears at bottom-center without an
+                // animation/frame flicker. Trade-off accepted vs the original
+                // 'looks-launch-failed' concern: the tray icon + 'OmniVoice
+                // Dictation' tooltip provide the app-running signal.
+                match app.get_webview_window("widget") {
+                    Some(win) => {
+                        // Defensive: make sure the widget is hidden on startup
+                        // regardless of what window-state restored. The denylist
+                        // above should handle it, but belt-and-braces.
+                        let _ = win.hide();
+                        if let Ok(Some(monitor)) = win.primary_monitor() {
+                            let size = monitor.size();
+                            let scale = monitor.scale_factor();
+                            let logical_w = size.width as f64 / scale;
+                            let logical_h = size.height as f64 / scale;
+                            let x = (logical_w / 2.0 - 150.0) as i32;
+                            let y = (logical_h - 64.0 - 80.0) as i32;
+                            let _ = win.set_position(tauri::Position::Logical(
+                                tauri::LogicalPosition::new(x as f64, y as f64),
+                            ));
+                        } else {
+                            let _ = win.center();
+                        }
+                        log::info!("Pill mode: widget window pre-positioned at bottom-center (hidden until activated)");
+                    }
+                    None => log::error!(
+                        "Pill mode: widget window NOT FOUND — get_webview_window(\"widget\") \
+                         returned None. Check tauri.conf.json windows[label=\"widget\"]."
+                    ),
+                }
             } else {
                 // Studio mode: widget window stays hidden but ready for the
-                // global shortcut. It's already visible:false in tauri.conf.json.
+                // global shortcut. Belt-and-braces hide() in case any plugin
+                // or stale state would otherwise show it on startup.
+                if let Some(win) = app.get_webview_window("widget") {
+                    let _ = win.hide();
+                }
             }
 
             // ── Enable microphone / camera on Linux (WebKitGTK) ──────────

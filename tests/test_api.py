@@ -70,10 +70,17 @@ def _mock_model():
 
 @pytest.fixture()
 def client():
-    """Create a TestClient for the FastAPI app (no server needed)."""
+    """Create a TestClient for the FastAPI app (no server needed).
+
+    `client=("127.0.0.1", 50000)` makes `request.client.host` resolve to a
+    loopback address — required because `backend/api/routers/system.py` is
+    now gated by a router-level `require_loopback` dependency. Tests that
+    deliberately exercise the non-loopback rejection path build their own
+    plain `TestClient(app)` (which defaults to host='testclient').
+    """
     from fastapi.testclient import TestClient
     from main import app
-    return TestClient(app)
+    return TestClient(app, client=("127.0.0.1", 50000))
 
 
 @pytest.fixture()
@@ -535,3 +542,116 @@ class TestStreamingTTS:
             assert res.headers.get("x-audio-duration") is not None
             # Verify it's valid WAV
             assert len(res.content) > 44  # WAV header is 44 bytes minimum
+
+
+# ---------------------------------------------------------------------------
+# /system/set-env loopback-origin guard (260518-ivy security fix)
+# ---------------------------------------------------------------------------
+
+def test_set_env_rejects_non_loopback():
+    """A TestClient that does NOT override `client=` sets
+    `request.client.host = 'testclient'` (non-loopback). The router-level
+    `require_loopback` dependency must return 403 and must NOT mutate
+    os.environ. NOTE: the project-wide `client` fixture is now built with a
+    loopback override so most tests see protected routes — this test
+    instantiates its own plain client to exercise the rejection path."""
+    from fastapi.testclient import TestClient
+    from main import app
+
+    sentinel = "__set_env_should_not_be_set__"
+    # Ensure HF_TOKEN does not currently equal the sentinel
+    original = os.environ.get("HF_TOKEN")
+    os.environ.pop("HF_TOKEN", None)
+    try:
+        non_loopback_client = TestClient(app)  # default client.host = 'testclient'
+        res = non_loopback_client.post("/system/set-env", json={"key": "HF_TOKEN", "value": sentinel})
+        assert res.status_code == 403
+        assert "loopback" in res.json().get("detail", "").lower()
+        # Guard must short-circuit before the os.environ mutation
+        assert os.environ.get("HF_TOKEN") != sentinel
+    finally:
+        if original is None:
+            os.environ.pop("HF_TOKEN", None)
+        else:
+            os.environ["HF_TOKEN"] = original
+
+
+def test_set_env_allows_loopback():
+    """A TestClient explicitly constructed with client=('127.0.0.1', ...) must pass
+    the loopback gate, mutate os.environ, and return the documented payload."""
+    from fastapi.testclient import TestClient
+    from main import app
+
+    loopback_client = TestClient(app, client=("127.0.0.1", 50000))
+    original = os.environ.get("HF_TOKEN")
+    os.environ.pop("HF_TOKEN", None)
+    try:
+        res = loopback_client.post(
+            "/system/set-env",
+            json={"key": "HF_TOKEN", "value": "hf_loopback_ok"},
+        )
+        assert res.status_code == 200
+        assert res.json() == {"key": "HF_TOKEN", "set": True}
+        assert os.environ.get("HF_TOKEN") == "hf_loopback_ok"
+    finally:
+        if original is None:
+            os.environ.pop("HF_TOKEN", None)
+        else:
+            os.environ["HF_TOKEN"] = original
+
+
+def test_set_env_loopback_still_validates_allowlist():
+    """Even on the loopback path, keys outside the allow-list must return 400 —
+    the new guard must NOT bypass the existing allow-list enforcement."""
+    from fastapi.testclient import TestClient
+    from main import app
+
+    loopback_client = TestClient(app, client=("127.0.0.1", 50000))
+    res = loopback_client.post(
+        "/system/set-env",
+        json={"key": "DISALLOWED", "value": "x"},
+    )
+    assert res.status_code == 400
+    assert "DISALLOWED" not in os.environ
+
+
+# ---------------------------------------------------------------------------
+# Router-wide loopback guard — covers the previously-unprotected siblings
+# enumerated in
+# .planning/quick/260518-ivy-add-loopback-origin-check-to-system-set-/
+# 260518-ivy-deferred-items.md. Two representative routes are sampled here:
+#   - /clean-audio  (POST, resource-exhaustion vector)
+#   - /system/info  (GET,  info-disclosure vector)
+# The router-level dependency means every other route on the system router
+# is covered by the same gate without per-route tests.
+# ---------------------------------------------------------------------------
+
+def test_clean_audio_rejects_non_loopback():
+    """`/clean-audio` (POST) was previously reachable from any LAN host —
+    a resource-exhaustion vector (uploads + demucs CPU/GPU burn). Now gated
+    at the router level."""
+    from fastapi.testclient import TestClient
+    from main import app
+
+    non_loopback_client = TestClient(app)  # host = 'testclient'
+    # Multipart payload doesn't matter — the dependency must short-circuit
+    # before the body is parsed. Send empty bytes to keep the test fast.
+    res = non_loopback_client.post(
+        "/clean-audio",
+        files={"audio": ("x.wav", b"", "audio/wav")},
+    )
+    assert res.status_code == 403
+    assert "loopback" in res.json().get("detail", "").lower()
+
+
+def test_system_info_rejects_non_loopback():
+    """`/system/info` (GET) leaks data_dir, outputs_dir, crash_log_path,
+    model checkpoints, and other host details to any reachable origin —
+    info-disclosure vector. Now gated at the router level."""
+    from fastapi.testclient import TestClient
+    from main import app
+
+    non_loopback_client = TestClient(app)  # host = 'testclient'
+    res = non_loopback_client.get("/system/info")
+    assert res.status_code == 403
+    assert "loopback" in res.json().get("detail", "").lower()

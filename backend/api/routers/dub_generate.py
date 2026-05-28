@@ -13,7 +13,8 @@ from core.config import DUB_DIR, VOICES_DIR
 from core.tasks import task_manager
 from schemas.requests import DubRequest
 from services.model_manager import get_model, _gpu_pool
-from services.audio_dsp import apply_mastering, normalize_audio
+from services.audio_dsp import apply_mastering, normalize_audio, apply_effects_chain, get_effect_chain
+from services.audio_io import atomic_save_wav, _safe_torchaudio_save
 from services.rvc import apply_rvc, is_enabled as rvc_is_enabled
 from services.incremental import segment_fingerprint
 from services.watermark import embed_watermark
@@ -107,7 +108,7 @@ async def dub_generate(job_id: str, req: DubRequest):
                 sync_scores.append(1.0)
                 continue
 
-            def _gen(text, lang, instruct_str, dur_s, nstep, cfg, spd, profile_id=None):
+            def _gen(text, lang, instruct_str, dur_s, nstep, cfg, spd, profile_id, effect_preset):
                 ref_audio = None
                 ref_text = None
                 used_seed = None
@@ -160,27 +161,81 @@ async def dub_generate(job_id: str, req: DubRequest):
                         speed=spd, denoise=True, postprocess_output=True,
                     )
                     audio_out = audios[0]
-                    mastered_audio = apply_mastering(audio_out, sample_rate=_model.sampling_rate if hasattr(_model, 'sampling_rate') else 24000)
+                    sr = _model.sampling_rate if hasattr(_model, 'sampling_rate') else 24000
+
+                    # Apply per-segment DSP effect preset (default: broadcast)
+                    seg_effect_preset = effect_preset or "broadcast"
+                    if seg_effect_preset == "raw":
+                        return audio_out
+
+                    mastered_audio = apply_mastering(audio_out, sample_rate=sr)
+                    effect_chain = get_effect_chain(seg_effect_preset)
+                    if effect_chain:
+                        mastered_audio = apply_effects_chain(
+                            mastered_audio,
+                            sample_rate=sr,
+                            chain=effect_chain,
+                        )
                     return normalize_audio(mastered_audio, target_dBFS=-2.0)
                 except Exception as e:
+                    is_oom = (
+                        isinstance(e, torch.cuda.OutOfMemoryError)
+                        or "out of memory" in str(e).lower()
+                        or "CUDA error" in str(e)
+                    )
                     import gc
                     gc.collect()
-                    if torch.backends.mps.is_available():
-                        torch.mps.empty_cache()
-                    elif torch.cuda.is_available():
+                    if torch.cuda.is_available():
                         torch.cuda.empty_cache()
-                    # User-facing: what happened · why · what to do.
-                    raise RuntimeError(
-                        f"Ran out of GPU memory generating this segment. "
-                        f"Try the Flush button in the header to free VRAM, or switch to CPU in Settings. "
-                        f"Underlying error: {e}"
-                    )
+                    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                        torch.mps.empty_cache()
 
-            seg_instruct = seg.instruct or req.instruct
+                    if not is_oom:
+                        raise
+
+                    retry_steps = min(nstep, 8)
+                    logger.warning(
+                        "OOM on segment (nstep=%d), retrying with %d steps after cache flush",
+                        nstep, retry_steps,
+                    )
+                    try:
+                        audios = _model.generate(
+                            text=text, language=lang if lang != "Auto" else None,
+                            ref_audio=ref_audio, ref_text=ref_text,
+                            instruct=instruct_str if instruct_str else None,
+                            duration=dur_s, num_step=retry_steps, guidance_scale=cfg,
+                            speed=spd, denoise=True, postprocess_output=True,
+                        )
+                        audio_out = audios[0]
+                        sr = _model.sampling_rate if hasattr(_model, 'sampling_rate') else 24000
+
+                        seg_effect_preset = effect_preset or "broadcast"
+                        if seg_effect_preset == "raw":
+                            return audio_out
+
+                        mastered_audio = apply_mastering(audio_out, sample_rate=sr)
+                        effect_chain = get_effect_chain(seg_effect_preset)
+                        if effect_chain:
+                            mastered_audio = apply_effects_chain(
+                                mastered_audio,
+                                sample_rate=sr,
+                                chain=effect_chain,
+                            )
+                        return normalize_audio(mastered_audio, target_dBFS=-2.0)
+                    except Exception as retry_err:
+                        raise RuntimeError(
+                            f"Ran out of GPU memory generating this segment. "
+                            f"Retried with {retry_steps} steps but still failed. "
+                            f"Try the Flush button in the header to free VRAM, "
+                            f"or switch to CPU in Settings. "
+                            f"Underlying error: {retry_err}"
+                        ) from retry_err
+
             seg_profile = seg.profile_id or None
             seg_speed = seg.speed if hasattr(seg, 'speed') and seg.speed is not None else req.speed
             seg_lang = seg.target_lang if getattr(seg, 'target_lang', None) else req.language
 
+            seg_instruct = seg.instruct or req.instruct
             # Phase 4.2 — if the segment carries a free-form direction, parse it
             # and append the taxonomy instruct (e.g. "urgent, surprised") on top
             # of whatever instruct was already set. Also apply the director's
@@ -210,10 +265,11 @@ async def dub_generate(job_id: str, req: DubRequest):
                 # flag to restore num_step=req.num_step quality.
                 _num_step = 8 if req.preview else req.num_step
                 _t_tts_0 = time.perf_counter()
+                seg_effect_preset = getattr(seg, "effect_preset", None) or "broadcast"
                 audio_tensor = await loop.run_in_executor(
                     _gpu_pool, _gen,
                     seg.text, seg_lang, seg_instruct, seg_duration,
-                    _num_step, req.guidance_scale, seg_speed, seg_profile,
+                    _num_step, req.guidance_scale, seg_speed, seg_profile, seg_effect_preset,
                 )
                 _t_tts += time.perf_counter() - _t_tts_0
 
@@ -247,6 +303,7 @@ async def dub_generate(job_id: str, req: DubRequest):
                         "instruct": getattr(seg, "instruct", None),
                         "speed": getattr(seg, "speed", None),
                         "direction": getattr(seg, "direction", None),
+                        "effect_preset": getattr(seg, "effect_preset", None),
                     })
                 except Exception as e:
                     logger.debug("seg fingerprint skipped for %s: %s", seg_id, e)
@@ -257,7 +314,7 @@ async def dub_generate(job_id: str, req: DubRequest):
                 # when RVC is active (uncommon path).
                 if rvc_is_enabled():
                     seg_wav_path = os.path.join(DUB_DIR, job_id, f"seg_{i}.wav")
-                    torchaudio.save(seg_wav_path, audio_tensor, _model.sampling_rate)
+                    atomic_save_wav(seg_wav_path, audio_tensor, _model.sampling_rate)
                     try:
                         await loop.run_in_executor(_gpu_pool, apply_rvc, seg_wav_path)
                         rvc_wav, rvc_sr = torchaudio.load(seg_wav_path)
@@ -296,7 +353,7 @@ async def dub_generate(job_id: str, req: DubRequest):
             try:
                 # Apply invisible watermark before writing to disk
                 _wav = embed_watermark(_wav, _sr)
-                torchaudio.save(seg_wav_path, _wav, _sr)
+                atomic_save_wav(seg_wav_path, _wav, _sr)
             except Exception as e:
                 logger.warning("deferred seg write failed for %s: %s", _sid, e)
             if _fp is not None:
@@ -358,7 +415,7 @@ async def dub_generate(job_id: str, req: DubRequest):
         _t_save_0 = time.perf_counter()
         # Apply invisible watermark to the final assembled track
         full_audio = embed_watermark(full_audio, sr)
-        torchaudio.save(track_path, full_audio, sr)
+        atomic_save_wav(track_path, full_audio, sr)
         _t_save = time.perf_counter() - _t_save_0
         _t_mix = _t_save_0 - _t_loop_end
         job["dubbed_tracks"][lang_code] = {
@@ -476,7 +533,7 @@ async def preview_segment(job_id: str, req: SegmentPreviewRequest):
 
     sr = getattr(_model, "sampling_rate", 24000)
     buf = io.BytesIO()
-    torchaudio.save(buf, audio_tensor, sr, format="wav")
+    _safe_torchaudio_save(buf, audio_tensor, sr, format="wav")
     buf.seek(0)
 
     return Response(

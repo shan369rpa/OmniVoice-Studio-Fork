@@ -4,8 +4,9 @@ import uuid
 import psutil
 import asyncio
 import logging
-from fastapi import APIRouter, File, UploadFile, HTTPException, Query
+from fastapi import APIRouter, Depends, File, UploadFile, HTTPException, Query
 from api.schemas import SysinfoResponse, SystemInfoResponse, ModelStatusResponse, LogsResponse, FlushMemoryResponse
+from api.dependencies import require_loopback
 from fastapi.responses import FileResponse, StreamingResponse
 import torch
 import shutil
@@ -14,7 +15,17 @@ from core.config import OUTPUTS_DIR, DATA_DIR, CRASH_LOG_PATH, LOG_PATH, IDLE_TI
 from services.model_manager import get_model_status, get_best_device
 from services.ffmpeg_utils import find_ffmpeg, run_ffmpeg
 
-router = APIRouter()
+# Router-level loopback gate. Every route mounted on `router` (GET + POST,
+# present and future) is gated by `require_loopback`, which 403s any request
+# whose `client.host` is not a loopback address. This closes the same trust
+# boundary that PR #81 only patched on `/system/set-env` and that the
+# 260518-ivy deferred-items file enumerated for follow-up: /model/unload/*,
+# /system/logs/clear, /system/logs/tauri/clear, /system/flush-memory,
+# /clean-audio (POSTs) plus the read-side info-disclosure routes
+# /system/info, /system/logs, /system/logs/tauri, /system/logs/stream.
+# This router only ever serves the local Tauri shell and the dev frontend
+# at http://127.0.0.1:3901 — both are loopback origins.
+router = APIRouter(dependencies=[Depends(require_loopback)])
 logger = logging.getLogger("omnivoice.api")
 
 # Cache device checks at module load — they don't change at runtime
@@ -22,6 +33,20 @@ _is_mac = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
 _is_cuda = torch.cuda.is_available()
 # Prime psutil's internal CPU counter so the first non-blocking call returns useful data
 psutil.cpu_percent(interval=None)
+
+
+def _has_hf_token() -> bool:
+    # Phase 1 AUTH-01..06 cascade. Delegates to the 3-source resolver
+    # (App → Env → HF-CLI) instead of reading env/HF-CLI directly. This
+    # closes #35: a user who only ran `huggingface-cli login` (no env
+    # var, no app-store) is now reported as having a token, and so is a
+    # user who saved one in Settings.
+    try:
+        from services import token_resolver
+        return token_resolver.resolve() is not None
+    except Exception:
+        # Resolver must never break /system/info — fall back to False.
+        return False
 
 @router.get("/model/status", response_model=ModelStatusResponse)
 def model_status():
@@ -131,7 +156,7 @@ def system_info():
             "model_checkpoint": os.environ.get("OMNIVOICE_MODEL", "k2-fsa/OmniVoice"),
             "asr_model": os.environ.get("ASR_MODEL", "Systran/faster-whisper-large-v3"),
             "translate_provider": os.environ.get("TRANSLATE_PROVIDER", "google"),
-            "has_hf_token": bool(os.environ.get("HF_TOKEN")),
+            "has_hf_token": _has_hf_token(),
             "device": get_best_device(),
             "python": sys.version.split()[0],
             "platform": sys.platform,
@@ -430,8 +455,8 @@ def system_notifications():
     """
     notes = []
 
-    # 1. Missing HF_TOKEN
-    if not os.environ.get("HF_TOKEN"):
+    # 1. Missing HF_TOKEN (env var OR canonical ~/.cache/huggingface/token)
+    if not _has_hf_token():
         notes.append({
             "id": "hf-token-missing",
             "level": "warn",
@@ -517,6 +542,11 @@ async def set_env_var(body: dict):
 
     The value is set on os.environ for the running process.
     For persistence across restarts, users should set it in their shell profile.
+
+    The loopback-origin gate that previously lived inline here is now applied
+    at the router level via `dependencies=[Depends(require_loopback)]` on
+    `router` — see the top of this file. Every route on this router is
+    gated, including this one. The 403 body and behavior are unchanged.
     """
     ALLOWED_KEYS = {"HF_TOKEN", "TRANSLATE_API_KEY"}
     key = body.get("key", "")
@@ -599,3 +629,49 @@ async def _do_clean_audio(audio, tmp_dir, clean_id):
 
     return FileResponse(final_path, media_type="audio/wav", filename=clean_filename,
                         headers={"X-Clean-Filename": clean_filename})
+
+
+@router.get("/system/asr-backends")
+def asr_backends():
+    """List all registered ASR backends and their availability."""
+    from services.asr_backend import list_backends, active_backend_id
+    return {
+        "active": active_backend_id(),
+        "backends": list_backends(),
+    }
+
+
+# ── Phase 1 AUTH-01 / AUTH-03 — HF token resolver state ──────────────────
+
+
+@router.get("/system/hf-token/state")
+def hf_token_state():
+    """Return the 3-source HF token cascade state for the Settings UI
+    (Wave 2 React panel consumes this). Never returns the raw token —
+    only a masked preview, whoami username, and per-source validity.
+    """
+    from dataclasses import asdict
+    from services import token_resolver
+
+    s = token_resolver.state()
+    return {
+        "active": s["active"],
+        "sources": [asdict(row) for row in s["sources"]],
+    }
+
+
+# ── Phase 1 Wave 3 — macOS Gatekeeper quarantine probe (#54) ────────────
+
+
+@router.get("/system/quarantine-status")
+def quarantine_status():
+    """Report whether the running .app bundle has the macOS quarantine xattr.
+
+    On non-macOS platforms or dev runs (not inside a .app bundle), always
+    returns ``{"quarantined": false, "error_class": null}``. The React
+    ErrorBoundary polls this endpoint on first load and renders the docs
+    deeplink when ``error_class`` is set (Plan 01-02 wired the deeplink).
+    """
+    from core import gatekeeper_detect
+
+    return gatekeeper_detect.quarantine_status()

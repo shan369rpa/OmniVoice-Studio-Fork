@@ -13,6 +13,10 @@ try:
     import dotenv
 
     dotenv.load_dotenv()
+    # Also load .env from the project root (parent of backend/)
+    _project_env = os.path.join(os.path.dirname(_backend_dir), ".env")
+    if os.path.isfile(_project_env):
+        dotenv.load_dotenv(_project_env, override=False)
     # Also load the durable per-user config so env vars set once survive
     # Tauri/Finder launches that don't inherit a shell environment.
     _user_env = os.path.expanduser("~/.config/omnivoice/env")
@@ -23,7 +27,7 @@ except ImportError:
 
 # ── cuDNN 8 library preload ─────────────────────────────────────────────
 # CTranslate2 (used by faster-whisper / WhisperX) requires cuDNN 8, but
-# PyTorch 2.8+ pulls cuDNN 9. scripts/setup_cudnn.py installs cuDNN 8
+# PyTorch 2.8+ pulls cuDNN 9. scripts/setup.py installs cuDNN 8
 # side-by-side into cudnn8_compat/ (survives `uv sync`). We preload all
 # cuDNN 8 libs via ctypes so CTranslate2's dlopen/LoadLibrary finds them.
 if sys.platform != "darwin":  # macOS has no CUDA
@@ -130,6 +134,14 @@ logging.basicConfig(
     format=_LOG_FMT,
 )
 
+# Phase 1 AUTH-05 / threat T-01-02: install the HF-token redactor on the
+# root logger BEFORE any handler-attaching code runs. Every handler then
+# inherits the filter, so even handler-formatted output (file, stream,
+# JSON) strips real HF tokens. Cheap (regex on each record) and
+# idempotent — extra calls are no-ops.
+from core.logging_filter import install_redaction_filter  # noqa: E402
+install_redaction_filter()
+
 class AsyncioExceptionFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         if record.levelno == logging.WARNING and "socket.send() raised exception" in record.getMessage():
@@ -168,6 +180,9 @@ if not os.environ.get("OMNIVOICE_DISABLE_FILE_LOG"):
             _JsonFormatter() if _json_logs else logging.Formatter(_LOG_FMT)
         )
         logging.getLogger().addHandler(_file_handler)
+        # Re-install the redactor so the new file handler picks up the
+        # filter too (install_redaction_filter is idempotent).
+        install_redaction_filter()
     except Exception as _e:  # disk full, permission denied, etc. — don't block startup
         logging.getLogger("omnivoice.api").warning("Runtime log file disabled: %s", _e)
 
@@ -215,6 +230,8 @@ from api.routers import (
     openai_compat,
     tts_stream,
     marketplace,
+    sonitranslate,
+    settings as settings_router,  # Phase 1 AUTH-03: HF token save/clear/state
 )
 from utils import hf_progress
 
@@ -249,6 +266,30 @@ async def lifespan(app: FastAPI):
             logger.info("Startup: marked %d orphaned job(s) as failed.", swept)
     except Exception:
         logger.exception("Startup job-sweep failed (non-fatal).")
+    # Phase 1 Wave 3 — macOS Gatekeeper quarantine probe (#54).
+    # Detection is informational: we log a structured warning and broadcast
+    # an event so the React ErrorBoundary can render the docs deeplink. We
+    # do NOT auto-run `xattr -cr` — the app cannot clear its own quarantine
+    # state (per Anti-Pattern in 01-RESEARCH.md).
+    try:
+        from core import event_bus, gatekeeper_detect
+        status = gatekeeper_detect.quarantine_status()
+        if status.get("quarantined"):
+            logger.warning(
+                "Gatekeeper quarantine detected on app bundle %s — "
+                "users must run `xattr -cr <bundle>` once. error_class=%s",
+                status.get("bundle_path"),
+                status.get("error_class"),
+            )
+            event_bus.emit(
+                "system_error",
+                {
+                    "error_class": status.get("error_class"),
+                    "bundle_path": status.get("bundle_path"),
+                },
+            )
+    except Exception:
+        logger.exception("Gatekeeper probe failed (non-fatal).")
     idle_task = asyncio.create_task(idle_worker())
     worker_task = asyncio.create_task(task_manager.worker())
     # Warm the TTS model in the background so first /generate is instant.
@@ -426,6 +467,8 @@ app.include_router(capture_ws.router)
 app.include_router(openai_compat.router)
 app.include_router(tts_stream.router)
 app.include_router(marketplace.router)
+app.include_router(sonitranslate.router)
+app.include_router(settings_router.router)  # Phase 1 AUTH-03 endpoints
 
 frontend_path = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
 if os.path.exists(frontend_path):
@@ -438,8 +481,61 @@ else:
 
 
 if __name__ == "__main__":
+    import argparse
+    import sys
+    import threading
+    import time
+    import urllib.request
     import uvicorn
+
+    parser = argparse.ArgumentParser(prog="omnivoice-backend")
+    parser.add_argument(
+        "--health-check",
+        action="store_true",
+        help="Boot the server, poll /health, exit 0 on success / 1 on timeout. "
+             "Used by the release-time installer smoke step in .github/workflows/release.yml.",
+    )
+    args, _unknown = parser.parse_known_args()
+
+    if args.health_check:
+        HEALTH_URL = "http://127.0.0.1:3900/health"
+        TIMEOUT_S = 60
+        INTERVAL_S = 5
+
+        def _serve():
+            # log_level="warning" silences the per-request access log spam
+            # so the smoke output stays readable in GH Actions.
+            uvicorn.run(app, host="127.0.0.1", port=3900, log_level="warning")
+
+        t = threading.Thread(target=_serve, daemon=True)
+        t.start()
+
+        elapsed = 0
+        while elapsed < TIMEOUT_S:
+            try:
+                with urllib.request.urlopen(HEALTH_URL, timeout=2) as resp:
+                    if resp.status == 200:
+                        print(f"OK — /health responded 200 after {elapsed}s", flush=True)
+                        sys.exit(0)
+            except Exception:
+                pass
+            time.sleep(INTERVAL_S)
+            elapsed += INTERVAL_S
+
+        print(
+            f"FAIL — /health did not respond 200 within {TIMEOUT_S}s",
+            file=sys.stderr, flush=True,
+        )
+        sys.exit(1)
 
     # Port 3900 picked to dodge common 8000 conflicts (Django/Rails/Jupyter).
     # Rust sidecar launcher in lib.rs::BACKEND_PORT must stay in sync.
-    uvicorn.run(app, host="0.0.0.0", port=3900)
+    #
+    # SECURITY: default to loopback (127.0.0.1) so the API isn't reachable
+    # from the LAN out of the box. OmniVoice ships no authentication; binding
+    # to 0.0.0.0 by default would expose every router on this process to any
+    # host on the user's network. Docker images that need to publish the port
+    # set OMNIVOICE_BIND_HOST=0.0.0.0 explicitly (see deploy/docker-compose.yml)
+    # — the host-side port mapping is what enforces 127.0.0.1-only there.
+    _bind_host = os.environ.get("OMNIVOICE_BIND_HOST", "127.0.0.1")
+    uvicorn.run(app, host=_bind_host, port=3900)
