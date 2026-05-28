@@ -494,6 +494,16 @@ function App() {
 
   const handleNativeExport = async (e, sourceIdentifier, fallbackName, mode) => {
     if (e) { e.preventDefault(); e.stopPropagation(); }
+    // In Tauri desktop app: use native save dialog (plugin-dialog → invoke).
+    // In browser/web dev mode: fall back to standard blob download so
+    // @tauri-apps/plugin-dialog never tries to call window.__TAURI__.core.invoke
+    // (which is undefined outside the desktop shell) and throws the error:
+    // "Cannot read properties of undefined (reading 'invoke')".
+    if (!isTauri) {
+      const url = `${API}/audio/${sourceIdentifier}`;
+      triggerDownload(url, fallbackName || sourceIdentifier);
+      return;
+    }
     try {
       const { save } = await import('@tauri-apps/plugin-dialog');
       const ext = fallbackName.includes('.') ? fallbackName.split('.').pop() : 'wav';
