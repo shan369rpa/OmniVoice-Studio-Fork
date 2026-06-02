@@ -21,6 +21,8 @@ Ví dụ:
 | Ngày | Loại | File | Tóm tắt |
 |------|------|------|---------|
 | 2026-05-18 | bugfix | [2026-05-18_bugfix_tauri-invoke-export.md](./2026-05-18_bugfix_tauri-invoke-export.md) | `Export failed: Cannot read properties of undefined (reading 'invoke')` |
+| 2026-05-28 | fix | [2026-05-28_fix_lan-clone-mode.md](./2026-05-28_fix_lan-clone-mode.md) | CORS, loopback guard, API URL hardcode, auto-transcribe — LAN clone mode |
+| 2026-06-01 | fix+refactor+feat | [2026-06-01_fix_audio-trimmer-preview.md](./2026-06-01_fix_audio-trimmer-preview.md) | AudioTrimmer: Preview fix, playRegion refactor, played-region color, click-to-play, timecode input |
 
 ---
 

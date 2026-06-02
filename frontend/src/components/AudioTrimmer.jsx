@@ -25,7 +25,25 @@ function fmtHMS(t) {
   const m = Math.floor((t % 3600) / 60);
   const s = t % 60;
   if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${s.toFixed(2).padStart(5, '0')}`;
-  return `${m}:${s.toFixed(2).padStart(5, '0')}`;
+  return `${String(m).padStart(2, '0')}:${s.toFixed(2).padStart(5, '0')}`;
+}
+
+function parseTimecode(str) {
+  if (!str) return NaN;
+  const cleanStr = str.trim().replace(',', '.');
+  if (cleanStr.includes(':')) {
+    const parts = cleanStr.split(':');
+    let secs = 0;
+    if (parts.length === 3) {
+      secs = parseInt(parts[0]) * 3600 + parseInt(parts[1]) * 60 + parseFloat(parts[2]);
+    } else if (parts.length === 2) {
+      secs = parseInt(parts[0]) * 60 + parseFloat(parts[1]);
+    } else {
+      secs = parseFloat(cleanStr);
+    }
+    return isNaN(secs) ? NaN : secs;
+  }
+  return parseFloat(cleanStr);
 }
 
 export default function AudioTrimmer({ file, maxSeconds = 15, onConfirm, onCancel }) {
@@ -40,6 +58,8 @@ export default function AudioTrimmer({ file, maxSeconds = 15, onConfirm, onCance
   const dragStateRef = useRef(null);
   const pointerRef = useRef(null);
   const stateRef = useRef({ start: 0, end: 0, cursor: 0, viewStart: 0, viewEnd: 0, duration: 0 });
+  const audioUrlRef = useRef(null); // objectURL of current file
+  const playBoundaryRef = useRef(null); // vùng đang được phát thực tế
 
   const [ready, setReady] = useState(false);
   const [decoding, setDecoding] = useState(true);
@@ -52,8 +72,8 @@ export default function AudioTrimmer({ file, maxSeconds = 15, onConfirm, onCance
   const [viewEnd, setViewEnd] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [loop, setLoop] = useState(true);
-  const [startInput, setStartInput] = useState('0.00');
-  const [endInput, setEndInput] = useState('0.00');
+  const [startInput, setStartInput] = useState(() => fmtHMS(0));
+  const [endInput, setEndInput] = useState(() => fmtHMS(0));
 
   const [audioMeta, setAudioMeta] = useState(null);
 
@@ -64,8 +84,8 @@ export default function AudioTrimmer({ file, maxSeconds = 15, onConfirm, onCance
     };
   }, [start, end, cursor, viewStart, viewEnd]);
 
-  useEffect(() => { setStartInput(start.toFixed(2)); }, [start]);
-  useEffect(() => { setEndInput(end.toFixed(2)); }, [end]);
+  useEffect(() => { setStartInput(fmtHMS(start)); }, [start]);
+  useEffect(() => { setEndInput(fmtHMS(end)); }, [end]);
 
   // Decode (low rate mono) + async peaks — keeps UI responsive for long files.
   useEffect(() => {
@@ -106,13 +126,15 @@ export default function AudioTrimmer({ file, maxSeconds = 15, onConfirm, onCance
     return () => { cancelled = true; };
   }, [file, maxSeconds]);
 
-  // Bind audio src
+  // Bind audio src — also store URL in ref so togglePlay can re-apply if needed
   useEffect(() => {
     if (!file) return;
     const url = URL.createObjectURL(file);
+    audioUrlRef.current = url;
     const a = audioRef.current;
     if (a) { a.src = url; a.load(); }
     return () => {
+      audioUrlRef.current = null;
       if (a) { try { a.pause(); a.removeAttribute('src'); a.load(); } catch {} }
       URL.revokeObjectURL(url);
     };
@@ -224,6 +246,17 @@ export default function AudioTrimmer({ file, maxSeconds = 15, onConfirm, onCance
         }
       }
       if (mx < mn) { mn = 0; mx = 0; }
+      
+      // [FEATURE: played-region] START — change fillStyle for played part
+      let isPlayed = false;
+      const playheadT = audioRef.current ? audioRef.current.currentTime : s;
+      if (playheadT > s && playheadT <= e) {
+        const playedRight = tToX(playheadT);
+        if (x <= playedRight) isPlayed = true;
+      }
+      ctx.fillStyle = isPlayed ? '#fabd2f' : '#d3869b'; // gold if played, pink if not
+      // [FEATURE: played-region] END
+      
       const y1 = (1 - mx) * 0.5 * h;
       const y2 = (1 - mn) * 0.5 * h;
       ctx.fillRect(x, y1, 1, Math.max(1, y2 - y1));
@@ -399,6 +432,27 @@ export default function AudioTrimmer({ file, maxSeconds = 15, onConfirm, onCance
     schedulePointer();
   };
 
+  // [FEATURE: click-to-play] START — double-click waveform = seek + auto play
+  const onCanvasDblClick = (e) => {
+    if (!ready) return;
+    e.preventDefault();
+    const buffer = bufferRef.current;
+    const a = audioRef.current;
+    if (!buffer || !a) return;
+    const t = clamp(xToTime(e.clientX), 0, buffer.duration);
+    
+    // Xóa A, B cũ, đặt playhead tại điểm click
+    setStart(t);
+    setEnd(t);
+    setCursor(t);
+    setStartInput(fmtHMS(t));
+    setEndInput(fmtHMS(t));
+    
+    // Gọi hàm phát nhạc
+    playRegion(t, t);
+  };
+  // [FEATURE: click-to-play] END
+
   const onWheel = useCallback((e) => {
     const buffer = bufferRef.current;
     if (!buffer) return;
@@ -457,47 +511,94 @@ export default function AudioTrimmer({ file, maxSeconds = 15, onConfirm, onCance
     setViewEnd(nve);
   };
 
-  const togglePlay = () => {
+  const playRegion = useCallback((s, e) => {
     const a = audioRef.current;
     if (!a) return;
-    if (playing) { a.pause(); setPlaying(false); return; }
-    const s = stateRef.current.start;
+    
+    // Lưu lại vùng cần phát
+    playBoundaryRef.current = { start: s, end: e };
+    
+    // [FEATURE: click-to-play] Nếu vùng chọn quá nhỏ, cho phép phát vượt quá B đến hết file
+    if (e - s < 0.1) {
+      playBoundaryRef.current.end = bufferRef.current ? bufferRef.current.duration : e;
+    }
+    
     const doPlay = () => {
       try { a.currentTime = s; } catch (err) { console.warn('currentTime set failed', err); }
       a.play().then(() => setPlaying(true)).catch((err) => {
         setError('Playback failed: ' + (err.message || err));
       });
     };
-    // HAVE_METADATA = 1 is enough to set currentTime on most browsers.
-    if (a.readyState >= 1) {
+    
+    if (a.readyState >= 2) {
       doPlay();
     } else {
-      a.addEventListener('loadedmetadata', doPlay, { once: true });
-      a.addEventListener('error', () => setError('Audio load failed'), { once: true });
+      const url = audioUrlRef.current;
+      if (!url) { setError('No audio source available'); return; }
+      if (!a.src || a.src !== url) { a.src = url; }
+      const onReady = () => {
+        a.removeEventListener('canplay', onReady);
+        a.removeEventListener('error', onErr);
+        doPlay();
+      };
+      const onErr = () => {
+        a.removeEventListener('canplay', onReady);
+        a.removeEventListener('error', onErr);
+        setError('Audio load failed — cannot preview');
+      };
+      a.addEventListener('canplay', onReady, { once: true });
+      a.addEventListener('error', onErr, { once: true });
+      a.load();
     }
+  }, []);
+
+  const togglePlay = () => {
+    const a = audioRef.current;
+    if (!a) return;
+    if (playing) { a.pause(); setPlaying(false); return; }
+    
+    // Cập nhật lại thông số end, start mới nhất từ input
+    const s = commitStartInput();
+    const e = commitEndInput();
+    
+    playRegion(s, e);
   };
 
   useEffect(() => {
     const a = audioRef.current;
     if (!a) return;
     let raf;
+    // Enforce selection boundary — called from both RAF and timeupdate for reliability
+    const enforceBoundary = () => {
+      if (!playBoundaryRef.current) return;
+      const { start: s, end: e } = playBoundaryRef.current;
+      
+      if (a.currentTime >= e) {
+        if (loop) {
+          try { a.currentTime = s; } catch {}
+        } else {
+          a.pause();
+          setPlaying(false);
+        }
+      }
+    };
     const tick = () => {
       if (!a.paused) {
         setCursor(a.currentTime);
-        const { start: s, end: e } = stateRef.current;
-        if (a.currentTime >= e) {
-          if (loop) {
-            try { a.currentTime = s; } catch {}
-          } else {
-            a.pause();
-            setPlaying(false);
-          }
-        }
+        enforceBoundary();
       }
       raf = requestAnimationFrame(tick);
     };
+    // timeupdate fires ~4x/sec — backup for RAF in case of tab throttling
+    const onTimeUpdate = () => {
+      if (!a.paused) enforceBoundary();
+    };
     raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
+    a.addEventListener('timeupdate', onTimeUpdate);
+    return () => {
+      cancelAnimationFrame(raf);
+      a.removeEventListener('timeupdate', onTimeUpdate);
+    };
   }, [loop]);
 
   const duration = end - start;
@@ -505,15 +606,29 @@ export default function AudioTrimmer({ file, maxSeconds = 15, onConfirm, onCance
   const tooShort = duration < 0.1;
 
   const commitStartInput = () => {
-    const v = parseFloat(startInput);
-    if (isFinite(v)) setStart(clamp(v, 0, Math.max(0, end - 0.02)));
-    else setStartInput(start.toFixed(2));
+    const v = parseTimecode(startInput);
+    if (isFinite(v)) {
+      const val = clamp(v, 0, Math.max(0, end - 0.02));
+      setStart(val);
+      setStartInput(fmtHMS(val));
+      return val;
+    } else {
+      setStartInput(fmtHMS(start));
+      return start;
+    }
   };
   const commitEndInput = () => {
     const buffer = bufferRef.current;
-    const v = parseFloat(endInput);
-    if (isFinite(v) && buffer) setEnd(clamp(v, start + 0.02, buffer.duration));
-    else setEndInput(end.toFixed(2));
+    const v = parseTimecode(endInput);
+    if (isFinite(v) && buffer) {
+      const val = clamp(v, start + 0.02, buffer.duration);
+      setEnd(val);
+      setEndInput(fmtHMS(val));
+      return val;
+    } else {
+      setEndInput(fmtHMS(end));
+      return end;
+    }
   };
 
   const onKeyDown = (e) => {
@@ -601,14 +716,15 @@ export default function AudioTrimmer({ file, maxSeconds = 15, onConfirm, onCance
         <canvas ref={rulerRef} className="audio-trimmer__ruler" />
 
         {/* Waveform */}
-        <canvas ref={waveRef} onMouseDown={onCanvasDown} className="audio-trimmer__wave" />
+        {/* [FEATURE: click-to-play] onDoubleClick added */}
+        <canvas ref={waveRef} onMouseDown={onCanvasDown} onDoubleClick={onCanvasDblClick} className="audio-trimmer__wave" />
 
         {/* Numeric fields */}
         <div className="audio-trimmer__fields">
           <label className="trim-field">
             <span className="trim-field__label">Start</span>
             <input
-              type="text" inputMode="decimal" value={startInput}
+              type="text" inputMode="text" value={startInput}
               onChange={(e) => setStartInput(e.target.value)}
               onBlur={commitStartInput}
               onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); commitStartInput(); } }}
@@ -619,7 +735,7 @@ export default function AudioTrimmer({ file, maxSeconds = 15, onConfirm, onCance
           <label className="trim-field">
             <span className="trim-field__label">End</span>
             <input
-              type="text" inputMode="decimal" value={endInput}
+              type="text" inputMode="text" value={endInput}
               onChange={(e) => setEndInput(e.target.value)}
               onBlur={commitEndInput}
               onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); commitEndInput(); } }}
