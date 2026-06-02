@@ -60,6 +60,7 @@ _BASE_SCHEMA = """
         duration_seconds REAL,
         generation_time REAL,
         seed INTEGER DEFAULT NULL,
+        client_id TEXT DEFAULT NULL,
         created_at REAL,
         FOREIGN KEY (profile_id) REFERENCES voice_profiles(id)
     );
@@ -146,6 +147,7 @@ _ALLOWED_MIGRATIONS = {
     ("voice_profiles", "is_locked"),
     ("voice_profiles", "personality"),
     ("generation_history", "seed"),
+    ("generation_history", "client_id"),
     ("dub_history", "content_hash"),
 }
 
@@ -182,6 +184,9 @@ def _migrate(conn, current: int) -> int:
     if current < 4:
         _add_column_if_missing(conn, "voice_profiles", "personality", "TEXT DEFAULT ''")
         current = 4
+    if current < 5:
+        _add_column_if_missing(conn, "generation_history", "client_id", "TEXT DEFAULT NULL")
+        current = 5
     return current
 
 

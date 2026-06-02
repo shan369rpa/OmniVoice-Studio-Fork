@@ -8,16 +8,16 @@ Currently exposed:
 - `require_loopback`: 403 unless the request came from a loopback origin.
 """
 
+import os
+
 from fastapi import HTTPException, Request
 
 
 # IPv4 + IPv6 loopback literals + the conventional `localhost` hostname.
-# `request.client.host` carries an address, not a hostname, so the literal
-# "localhost" entry is defensive — some upstream wrappers (TestClient with
-# a custom client tuple, certain reverse-proxy headers) may pass strings
-# rather than parsed addresses. We accept the broader set without weakening
-# the guard: nothing here matches a non-loopback origin.
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+# LAN mode: skip loopback check to allow LAN clients
+_lan_mode = os.environ.get("OMNIVOICE_LAN_MODE", "0").strip() == "1"
 
 
 def require_loopback(request: Request) -> None:
@@ -35,7 +35,12 @@ def require_loopback(request: Request) -> None:
     Returns None on success (FastAPI dependency convention). Raises 403
     on rejection — the response body is `{"detail": "loopback origin required"}`
     so existing tests for `/system/set-env` keep passing without modification.
+
+    When OMNIVOICE_LAN_MODE=1, loopback check is bypassed to allow LAN clients.
     """
+    if _lan_mode:
+        return
     host = request.client.host if request.client else None
     if host not in _LOOPBACK_HOSTS:
         raise HTTPException(status_code=403, detail="loopback origin required")
+

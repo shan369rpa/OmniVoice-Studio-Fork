@@ -417,10 +417,15 @@ _allowed = os.environ.get(
     "http://localhost:3901,http://127.0.0.1:3901,tauri://localhost,http://tauri.localhost",
 ).split(",")
 
+# LAN mode: nếu OMNIVOICE_LAN_MODE=1 thì chấp nhận mọi origin (dev-only)
+_lan_mode = os.environ.get("OMNIVOICE_LAN_MODE", "0").strip() == "1"
+if _lan_mode:
+    _allowed = ["*"]
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[o.strip() for o in _allowed if o.strip()],
-    allow_credentials=True,
+    allow_credentials=not _lan_mode,  # credentials + origins=* is forbidden by CORS spec
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["Content-Disposition"],

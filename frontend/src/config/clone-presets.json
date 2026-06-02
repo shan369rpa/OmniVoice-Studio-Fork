@@ -1,0 +1,87 @@
+[
+  {
+    "id": "preset_1",
+    "name": "1. Giọng Sư Ông 1",
+    "description": "Giọng nói bình thường",
+    "instruct": "male, elderly, very low pitch",
+    "config": {
+      "steps": 64,
+      "speed": 1.0,
+      "cfg": 2.0,
+      "tShift": 0.05,
+      "posTemp": 3.0,
+      "classTemp": 0.0,
+      "layerPenalty": 7.0,
+      "denoise": false,
+      "postprocess": false
+    }
+  },
+  {
+    "id": "preset_2",
+    "name": "2. Giọng Sư Ông 2",
+    "description": "Giọng nói rất chậm",
+    "instruct": "male, elderly, very low pitch",
+    "config": {
+      "steps": 64,
+      "speed": 0.8,
+      "cfg": 2.0,
+      "tShift": 0.05,
+      "posTemp": 3.0,
+      "classTemp": 0.0,
+      "layerPenalty": 7.0,
+      "denoise": false,
+      "postprocess": true
+    }
+  },
+  {
+    "id": "preset_3",
+    "name": "3. Giọng Sư Ông 3",
+    "description": "Giọng nói chậm",
+    "instruct": "male, elderly, very low pitch",
+    "config": {
+      "steps": 16,
+      "speed": 0.8,
+      "cfg": 2.0,
+      "tShift": 0.05,
+      "posTemp": 3.0,
+      "classTemp": 0.0,
+      "layerPenalty": 7.0,
+      "denoise": false,
+      "postprocess": false
+    }
+  },
+  {
+    "id": "preset_4",
+    "name": "4. Giọng Sư Ông 4",
+    "description": "Giọng nói nhanh",
+    "instruct": "male, elderly, very low pitch",
+    "config": {
+      "steps": 64,
+      "speed": 1.2,
+      "cfg": 2.0,
+      "tShift": 0.05,
+      "posTemp": 3.0,
+      "classTemp": 0.0,
+      "layerPenalty": 7.0,
+      "denoise": false,
+      "postprocess": true
+    }
+  },
+  {
+    "id": "preset_5",
+    "name": "5. Giọng Sư Ông 5",
+    "description": "Giọng nói rất nhanh",
+    "instruct": "male, elderly, very low pitch",
+    "config": {
+      "steps": 64,
+      "speed": 1.2,
+      "cfg": 2.0,
+      "tShift": 0.05,
+      "posTemp": 3.0,
+      "classTemp": 0.0,
+      "layerPenalty": 7.0,
+      "denoise": false,
+      "postprocess": true
+    }
+  }
+]

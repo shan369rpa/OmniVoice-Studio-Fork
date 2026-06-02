@@ -22,7 +22,7 @@ export default defineConfig({
   server: {
     port: 3901,
     strictPort: true,
-    host: false,
+    host: true,  // 0.0.0.0 — cho phép LAN truy cập
     watch: {
       ignored: ["**/src-tauri/**"],
     },

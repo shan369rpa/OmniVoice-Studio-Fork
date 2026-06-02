@@ -100,11 +100,28 @@ export default function useAppData() {
   }, [modelStatus, modelSubStage, modelDetail, modelError, modelProgress]);
 
   // ── Data loading callbacks ──
+  const [historyFilter, setHistoryFilter] = useState('my');
+
   const loadProfiles = useCallback(async () => { try { setProfiles(await listProfiles()); } catch (e) {} }, []);
-  const loadHistory = useCallback(async () => { try { setHistory(await listHistory()); } catch (e) {} }, []);
+  const loadHistory = useCallback(async (filterMode) => { 
+    const fm = filterMode ?? historyFilter;
+    try { 
+      const clientId = fm === 'my' ? (localStorage.getItem('omnivoice.clientId') || undefined) : undefined;
+      setHistory(await listHistory({ clientId })); 
+    } catch (e) {} 
+  }, [historyFilter]);
   const loadDubHistory = useCallback(async () => { try { setDubHistory(await listDubHistory()); } catch (e) {} }, []);
   const loadProjects = useCallback(async () => { try { setStudioProjects(await listProjects()); } catch (e) {} }, []);
   const loadExportHistory = useCallback(async () => { try { setExportHistory(await listExportHistory()); } catch (e) {} }, []);
+  
+  useEffect(() => {
+    const handler = (e) => {
+      setHistoryFilter(e.detail);
+      loadHistory(e.detail);
+    };
+    window.addEventListener('cloneModeHistoryFilter', handler);
+    return () => window.removeEventListener('cloneModeHistoryFilter', handler);
+  }, [loadHistory]);
 
   // ── WebSocket real-time updates ──
   useRealtimeEvents({

@@ -7,8 +7,9 @@ import tempfile
 import contextlib
 import logging
 import traceback
+import traceback
 from typing import Optional
-from fastapi import APIRouter, File, Form, UploadFile, HTTPException
+from fastapi import APIRouter, File, Form, UploadFile, HTTPException, Header
 from fastapi.responses import StreamingResponse
 
 from core.db import db_conn
@@ -110,6 +111,7 @@ async def generate_speech(
     profile_id: Optional[str] = Form(None),
     seed: Optional[int] = Form(None),
     effect_preset: str = Form("broadcast"),
+    x_client_id: Optional[str] = Header(None),
 ):
     _model = await get_model()
 
@@ -176,10 +178,10 @@ async def generate_speech(
 
         with db_conn() as conn:
             conn.execute(
-                "INSERT INTO generation_history (id, text, mode, language, instruct, profile_id, audio_path, duration_seconds, generation_time, seed, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO generation_history (id, text, mode, language, instruct, profile_id, audio_path, duration_seconds, generation_time, seed, client_id, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (audio_id, text[:200], "clone" if ref_audio_path else "design",
                  language or "Auto", instruct or "", resolved_profile_id,
-                 audio_filename, audio_dur, gen_time, used_seed, time.time())
+                 audio_filename, audio_dur, gen_time, used_seed, x_client_id, time.time())
             )
         event_bus.emit("generation_history", {"action": "created", "id": audio_id})
 
@@ -239,9 +241,12 @@ def _safe_output_path(name):
 
 
 @router.get("/history")
-def list_history():
+def list_history(client_id: Optional[str] = None):
     with db_conn() as conn:
-        rows = conn.execute("SELECT * FROM generation_history ORDER BY created_at DESC LIMIT 50").fetchall()
+        if client_id:
+            rows = conn.execute("SELECT * FROM generation_history WHERE client_id=? ORDER BY created_at DESC LIMIT 50", (client_id,)).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM generation_history ORDER BY created_at DESC LIMIT 50").fetchall()
     return [dict(r) for r in rows]
 
 @router.delete("/history")

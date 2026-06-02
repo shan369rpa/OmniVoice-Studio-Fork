@@ -42,6 +42,7 @@ import useAppData from './hooks/useAppData';
 import useProfiles from './hooks/useProfiles';
 import useTTS from './hooks/useTTS';
 import useDubWorkflow from './hooks/useDubWorkflow';
+import useCloneMode from './hooks/useCloneMode';
 
 const LazyFallback = () => <div className="app-lazy-fallback">Loading…</div>;
 
@@ -85,8 +86,22 @@ function App() {
   });
   const showCheatsheet = useAppStore(s => s.showCheatsheet);
   const setShowCheatsheet = useAppStore(s => s.setShowCheatsheet);
+  
+  const { isCloneMode } = useCloneMode();
+  
+  // Voice-profile navigation — slice owns "remember where I was" for Back.
+  // Declared here (before the clone-mode guard) because the useEffect below
+  // references activeVoiceId in its dependency array.
+  const activeVoiceId = useAppStore(s => s.activeVoiceId);
+  const openVoiceProfile = useAppStore(s => s.openVoiceProfile);
+  const closeVoiceProfile = useAppStore(s => s.closeVoiceProfile);
 
-
+  // Force allowed modes when in clone mode
+  useEffect(() => {
+    if (isCloneMode && !['clone', 'gallery'].includes(mode) && !activeVoiceId) {
+      setMode('clone');
+    }
+  }, [isCloneMode, mode, activeVoiceId, setMode]);
 
   // Global '?' → open cheatsheet
   useEffect(() => {
@@ -101,7 +116,6 @@ function App() {
     window.addEventListener('keydown', h);
     return () => window.removeEventListener('keydown', h);
   }, []);
-
 
 
 
@@ -126,10 +140,6 @@ function App() {
       return next;
     });
   }, []);
-  // Voice-profile navigation — slice owns "remember where I was" for Back.
-  const activeVoiceId = useAppStore(s => s.activeVoiceId);
-  const openVoiceProfile = useAppStore(s => s.openVoiceProfile);
-  const closeVoiceProfile = useAppStore(s => s.closeVoiceProfile);
   const hideSidebar = mode === 'launchpad' || mode === 'settings' || mode === 'voice' || mode === 'donate'
     || mode === 'queue' || mode === 'tools' || mode === 'projects' || mode === 'gallery' || mode === 'enterprise' || mode === 'transcriptions'
     || mode === 'stories';
@@ -198,9 +208,9 @@ function App() {
     pendingTrimFile, setPendingTrimFile,
     isGenerating, generationTime,
     textAreaRef,
-    ingestRefAudio, insertTag, applyPreset,
+    ingestRefAudio, autoTranscribe, insertTag, applyPreset,
     handleGenerate,
-  } = useTTS({ selectedProfile, setSelectedProfile, loadHistory });
+  } = useTTS({ selectedProfile, setSelectedProfile, loadHistory, isCloneMode });
 
   const handleSaveProfile = () => _handleSaveProfile(refAudio, refText, instruct, language);
 
@@ -214,11 +224,12 @@ function App() {
   const [isComparing, setIsComparing] = useState(false);
   const [compareProgress, setCompareProgress] = useState("");
 
-  // ═══ MIC RECORDING ═══
+  // ═══  // Mic recording
   const {
-    isRecording, isCleaning, recordingTime,
+    isRecording, isCleaning,
+    recordingTime,
     startRecording, stopRecording,
-  } = useRecording(ingestRefAudio);
+  } = useRecording(ingestRefAudio, { disabled: isCloneMode });
 
   // ═══ DUB STATE ═══
   const dubJobId           = useAppStore(s => s.dubJobId);
@@ -837,7 +848,7 @@ function App() {
               file={pendingTrimFile}
               maxSeconds={CLONE_MAX_SECONDS}
               onCancel={() => setPendingTrimFile(null)}
-              onConfirm={(trimmed) => { setPendingTrimFile(null); setRefAudio(trimmed); setSelectedProfile(null); toast.success('Trimmed audio loaded'); }}
+              onConfirm={(trimmed) => { setPendingTrimFile(null); setRefAudio(trimmed); setSelectedProfile(null); autoTranscribe(trimmed); toast.success('Trimmed audio loaded'); }}
             />
           </Suspense>
         </ErrorBoundary>
@@ -848,10 +859,11 @@ function App() {
         success: { iconTheme: { primary: '#b8bb26', secondary: '#fff' } }
       }}/>
 
-      <FloatingPill />
+      {!isCloneMode && <FloatingPill />}
 
 
       <Header
+        isCloneMode={isCloneMode}
         mode={mode} setMode={setMode}
         sysStats={sysStats} modelStatus={modelStatus}
         doubleClickMaximize={doubleClickMaximize}
@@ -864,7 +876,7 @@ function App() {
         }}
       />
 
-      <NavRail mode={mode} setMode={setMode} side={navRailSide} onFlipSide={flipNavRailSide} />
+      <NavRail isCloneMode={isCloneMode} mode={mode} setMode={setMode} side={navRailSide} onFlipSide={flipNavRailSide} />
 
       <div className="main-content">
 
@@ -1049,6 +1061,7 @@ function App() {
       {/* ── SIDEBAR ── */}
       <Suspense fallback={<LazyFallback />}>
         <Sidebar
+          isCloneMode={isCloneMode}
           availableTabs={availableSidebarTabs}
           isSidebarProjectsCollapsed={isSidebarProjectsCollapsed}
           setIsSidebarProjectsCollapsed={setIsSidebarProjectsCollapsed}
@@ -1137,9 +1150,11 @@ function App() {
 
 
       {/* ═══ BOTTOM LOGS PANEL (VSCode-style) ═══ */}
-      <Suspense fallback={null}>
-        <LogsFooter />
-      </Suspense>
+      {!isCloneMode && (
+        <Suspense fallback={null}>
+          <LogsFooter />
+        </Suspense>
+      )}
 
     </div>
   );

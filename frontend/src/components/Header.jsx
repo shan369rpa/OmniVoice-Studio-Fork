@@ -39,6 +39,7 @@ function WaveBars({ color = '#f3a5b6', active }) {
 }
 
 export default function Header({
+  isCloneMode,
   mode, setMode, sysStats, modelStatus, doubleClickMaximize,
   activeProjectName, onFlushMemory,
 }) {
@@ -190,9 +191,9 @@ export default function Header({
       {/* Right: wave + sys stats. UI scale (S/M/L) lives in the bottom
           LogsFooter bar so all app-wide chrome sits together. */}
       <div className="hq-col-right">
-        <NotificationPanel onNavigate={setMode} />
+        {!isCloneMode && <NotificationPanel onNavigate={setMode} />}
         <WaveBars color={view.accent} active={modelStatus === 'ready' || modelStatus === 'loading'} />
-        {sysStats && (
+        {!isCloneMode && sysStats && (
           <div className="hq-stats">
             {showLiveStats && (
               <>

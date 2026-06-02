@@ -8,8 +8,9 @@ export async function generateSpeech(
   return apiFetch('/generate', { method: 'POST', body: formData, signal });
 }
 
-export async function listHistory(): Promise<unknown> {
-  return apiJson('/history');
+export async function listHistory({ clientId }: { clientId?: string } = {}): Promise<unknown> {
+  const query = clientId ? `?client_id=${encodeURIComponent(clientId)}` : '';
+  return apiJson(`/history${query}`);
 }
 
 export async function clearHistory(): Promise<Response> {

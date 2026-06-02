@@ -5,12 +5,13 @@ import { playBlobAudio, playPing } from '../utils/media';
 import { probeAudioDuration } from '../utils/format';
 import { CLONE_MAX_SECONDS, PRESETS } from '../utils/constants';
 import { toast } from 'react-hot-toast';
+import { transcribeAudio } from '../api/transcribe';
 
 /**
  * Encapsulates TTS generation logic, streaming response handling,
  * audio ingestion (with trim gate), and preset/tag helpers.
  */
-export default function useTTS({ selectedProfile, setSelectedProfile, loadHistory }) {
+export default function useTTS({ selectedProfile, setSelectedProfile, loadHistory, isCloneMode = false }) {
   const text = useAppStore(s => s.text);
   const setText = useAppStore(s => s.setText);
   const language = useAppStore(s => s.language);
@@ -37,6 +38,23 @@ export default function useTTS({ selectedProfile, setSelectedProfile, loadHistor
   const timerRef = useRef(null);
   const textAreaRef = useRef(null);
 
+
+  // Auto-transcribe: gọi mỗi khi có file audio mới
+  const autoTranscribe = useCallback(async (file) => {
+    if (!file || !isCloneMode) return;
+    toast.loading("Auto-transcribing audio...", { id: 'transcribe_toast' });
+    try {
+      const { text: tText } = await transcribeAudio(file);
+      useAppStore.getState().setRefText(tText);
+      useAppStore.getState().setText(tText);
+      toast.success("Transcription complete", { id: 'transcribe_toast' });
+    } catch (err) {
+      console.error('[useTTS] transcribe error:', err);
+      toast.dismiss('transcribe_toast');
+      toast.error("Transcription failed");
+    }
+  }, [isCloneMode]);
+
   const ingestRefAudio = useCallback(async (file) => {
     if (!file) { setRefAudio(null); return; }
     const dur = await probeAudioDuration(file);
@@ -48,7 +66,8 @@ export default function useTTS({ selectedProfile, setSelectedProfile, loadHistor
     }
     setRefAudio(file);
     setSelectedProfile(null);
-  }, [setSelectedProfile]);
+    autoTranscribe(file);
+  }, [setSelectedProfile, isCloneMode, autoTranscribe]);
 
   const insertTag = useCallback((tag) => {
     if (!textAreaRef.current) return;
@@ -149,7 +168,7 @@ export default function useTTS({ selectedProfile, setSelectedProfile, loadHistor
     pendingTrimFile, setPendingTrimFile,
     isGenerating, generationTime,
     textAreaRef,
-    ingestRefAudio,
+    ingestRefAudio, autoTranscribe,
     insertTag, applyPreset,
     handleGenerate,
   };

@@ -7,7 +7,7 @@ import { useState, useRef } from 'react';
 import { toast } from 'react-hot-toast';
 import { cleanAudio as apiCleanAudio } from '../api/system';
 
-export default function useRecording(ingestRefAudio) {
+export default function useRecording(ingestRefAudio, { disabled = false } = {}) {
   const [isRecording, setIsRecording] = useState(false);
   const [isCleaning, setIsCleaning] = useState(false);
   const [recordingTime, setRecordingTime] = useState(0);
@@ -16,6 +16,7 @@ export default function useRecording(ingestRefAudio) {
   const recordingTimerRef = useRef(null);
 
   const startRecording = async () => {
+    if (disabled) return;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });

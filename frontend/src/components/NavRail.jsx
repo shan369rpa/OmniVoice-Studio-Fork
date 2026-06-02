@@ -33,16 +33,21 @@ function RailBtn({ active, Icon, label, accent, onClick }) {
   );
 }
 
-export default function NavRail({ mode, setMode, side = 'left', onFlipSide }) {
+export default function NavRail({ isCloneMode, mode, setMode, side = 'left', onFlipSide }) {
+  const visibleItems = isCloneMode
+    ? ITEMS.filter(it => ['clone', 'gallery'].includes(it.id))
+    : ITEMS;
+  const visibleFooter = isCloneMode ? [] : FOOTER_ITEMS;
+
   return (
     <aside className={`nav-rail rail-${side}`}>
       <div className="rail-top">
-        {ITEMS.map((it) => (
+        {visibleItems.map((it) => (
           <RailBtn key={it.id} {...it} active={mode === it.id} onClick={() => setMode(it.id)} />
         ))}
       </div>
       <div className="rail-bottom">
-        {FOOTER_ITEMS.map((it) => (
+        {visibleFooter.map((it) => (
           <RailBtn key={it.id} {...it} active={mode === it.id} onClick={() => setMode(it.id)} />
         ))}
         <button

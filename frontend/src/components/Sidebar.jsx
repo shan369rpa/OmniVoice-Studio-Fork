@@ -35,6 +35,7 @@ function timeAgo(ms) {
 
 export default function Sidebar(props) {
   const {
+    isCloneMode,
     availableTabs = ['projects', 'history', 'downloads'],
     isSidebarProjectsCollapsed, setIsSidebarProjectsCollapsed,
     sidebarTab, setSidebarTab,
@@ -60,6 +61,8 @@ export default function Sidebar(props) {
   const activeProjectId    = useAppStore(s => s.activeProjectId);
 
   const [sbQuery, setSbQuery] = useState('');
+  const [historyFilter, setHistoryFilter] = useState('my'); // 'my' or 'all'
+  
   const qLower = sbQuery.trim().toLowerCase();
   const matchesSearch = (s) => !qLower || (s || '').toLowerCase().includes(qLower);
   const filteredProjects = useMemo(() => studioProjects.filter(p =>
@@ -98,7 +101,7 @@ export default function Sidebar(props) {
     <div className={`glass-panel history-panel sidebar ${isSidebarCollapsed ? 'is-collapsed' : ''}`}>
       {/* Tab bar — only tabs relevant to the current view */}
       <div className="sidebar__tabs">
-        {SIDEBAR_TABS.filter(t => availableTabs.includes(t.id)).map(({ id, icon: Icon, accent }) => (
+        {SIDEBAR_TABS.filter(t => availableTabs.includes(t.id) && (!isCloneMode || t.id === 'history')).map(({ id, icon: Icon, accent }) => (
           <button
             key={id}
             onClick={() => setSidebarTab(id)}
@@ -320,7 +323,28 @@ export default function Sidebar(props) {
         {/* ── HISTORY TAB ── */}
         {sidebarTab === 'history' && (
           <>
-            {!isSidebarCollapsed && <div className="sidebar__subtitle">Generation history · Stored in SQLite</div>}
+            {!isSidebarCollapsed && (
+              <div className="sidebar__subtitle" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                Generation history
+                {isCloneMode && (
+                  <div style={{ display: 'flex', gap: '4px', fontSize: '10px' }}>
+                    <span 
+                      style={{ cursor: 'pointer', opacity: historyFilter === 'my' ? 1 : 0.5, textDecoration: historyFilter === 'my' ? 'underline' : 'none' }} 
+                      onClick={() => { setHistoryFilter('my'); window.dispatchEvent(new CustomEvent('cloneModeHistoryFilter', { detail: 'my' })); }}
+                    >
+                      My Items
+                    </span>
+                    <span style={{ opacity: 0.3 }}>|</span>
+                    <span 
+                      style={{ cursor: 'pointer', opacity: historyFilter === 'all' ? 1 : 0.5, textDecoration: historyFilter === 'all' ? 'underline' : 'none' }} 
+                      onClick={() => { setHistoryFilter('all'); window.dispatchEvent(new CustomEvent('cloneModeHistoryFilter', { detail: 'all' })); }}
+                    >
+                      All
+                    </span>
+                  </div>
+                )}
+              </div>
+            )}
             {(history.length + dubHistory.length) === 0 ? (
               <EmptyState
                 icon={History}
